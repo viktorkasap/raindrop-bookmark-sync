@@ -34,7 +34,7 @@
     "bookmarks",
     "sync"
   ],
-  "author": "",
+  "author": "Victor Kasap",
   "license": "MIT",
   "dependencies": {
     "nanoid": "^5.1.6",
