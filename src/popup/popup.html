@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Raindrop Bookmark Sync</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <header class="header">
+      <div class="logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#0066FF"/>
+          <path d="M2 17L12 22L22 17" stroke="#0066FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 12L12 17L22 12" stroke="#0066FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h1>Raindrop Sync</h1>
+      </div>
+    </header>
+
+    <!-- Not Authenticated State -->
+    <div id="not-authenticated" class="section hidden">
+      <div class="status-box warning">
+        <span class="status-icon">⚠️</span>
+        <span>Not connected to Raindrop.io</span>
+      </div>
+      <p class="setup-hint">Please configure your Test Token in Settings to get started.</p>
+      <button id="open-settings-btn" class="btn btn-primary btn-full">
+        Open Settings
+      </button>
+    </div>
+
+    <!-- Authenticated State -->
+    <div id="authenticated" class="section hidden">
+      <!-- User Info -->
+      <div class="user-info">
+        <span class="user-avatar">👤</span>
+        <span id="user-name" class="user-name">Loading...</span>
+        <button id="disconnect-btn" class="btn btn-small btn-secondary">
+          Disconnect
+        </button>
+      </div>
+
+      <!-- Sync Status -->
+      <div class="status-section">
+        <div class="status-row">
+          <span class="label">Status:</span>
+          <span id="sync-status" class="status-badge">Unknown</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Synced folders:</span>
+          <span id="mappings-count">0</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Total bookmarks:</span>
+          <span id="links-count">0</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Pending:</span>
+          <span id="pending-count">0</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Last sync:</span>
+          <span id="last-sync">Never</span>
+        </div>
+      </div>
+
+      <!-- Sync Toggle -->
+      <div class="toggle-section">
+        <label class="toggle-label">
+          <span>Enable sync</span>
+          <input type="checkbox" id="sync-toggle" class="toggle-input">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+
+      <!-- Actions -->
+      <div class="actions">
+        <button id="sync-now-btn" class="btn btn-primary btn-full">
+          Sync Now
+        </button>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <a href="#" id="options-link" class="footer-link">Settings</a>
+      <span class="separator">•</span>
+      <span class="version" id="version">v1.0.0</span>
+    </footer>
+  </div>
+
+  <script src="../popup.js"></script>
+</body>
+</html>

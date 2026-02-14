@@ -1,0 +1,42 @@
+{
+  "manifest_version": 2,
+  "name": "Raindrop Bookmark Sync",
+  "version": "1.0.0",
+  "description": "Two-way sync between Firefox bookmarks and Raindrop.io",
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "alarms",
+    "https://api.raindrop.io/*"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Raindrop Sync",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    }
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "browser_style": true
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "raindrop-bookmark-sync@victorkasap",
+      "strict_min_version": "91.0"
+    }
+  }
+}

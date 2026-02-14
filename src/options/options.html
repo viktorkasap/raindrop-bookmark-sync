@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Raindrop Bookmark Sync - Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="options-container">
+    <header class="header">
+      <div class="logo">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="#0066FF"/>
+          <path d="M2 17L12 22L22 17" stroke="#0066FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 12L12 17L22 12" stroke="#0066FF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <h1>Raindrop Bookmark Sync</h1>
+          <p class="subtitle">Settings</p>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <!-- API Token Section -->
+      <section class="section">
+        <h2 class="section-title">API Token</h2>
+        <p class="section-description">
+          Enter your Raindrop.io Test Token. Create an app in
+          <a href="https://app.raindrop.io/settings/integrations" target="_blank">Raindrop.io &rarr; Settings &rarr; Integrations</a>,
+          then copy the <strong>Test token</strong> value.
+        </p>
+        <div class="card">
+          <div id="connection-status" class="connection-status">
+            <span class="status-indicator disconnected"></span>
+            <span class="status-text">Not connected</span>
+          </div>
+          <div class="form-group">
+            <label for="api-token">Test Token</label>
+            <input type="password" id="api-token" class="input" placeholder="Paste your test token here...">
+          </div>
+          <div class="actions-grid">
+            <button id="save-token-btn" class="btn btn-primary">Save &amp; Connect</button>
+            <button id="disconnect-btn" class="btn btn-secondary hidden">Disconnect</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Folder Mapping Section -->
+      <section class="section" id="mapping-section">
+        <h2 class="section-title">Folder Mapping</h2>
+        <p class="section-description">
+          Select which Firefox bookmark folders to sync with Raindrop.io collections.
+        </p>
+
+        <div class="card">
+          <div class="mapping-form">
+            <div class="form-group">
+              <label for="firefox-folder">Firefox Folder</label>
+              <select id="firefox-folder" class="select">
+                <option value="">Select a folder...</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="raindrop-collection">Raindrop Collection</label>
+              <select id="raindrop-collection" class="select">
+                <option value="">Select a collection...</option>
+              </select>
+            </div>
+
+            <div class="form-group checkbox-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="sync-children" checked>
+                <span>Sync nested folders</span>
+              </label>
+            </div>
+
+            <button id="add-mapping-btn" class="btn btn-primary">
+              Add Mapping
+            </button>
+          </div>
+        </div>
+
+        <div class="card" id="mappings-card">
+          <h3 class="card-title">Current Mappings</h3>
+          <div id="mappings-list" class="mappings-list">
+            <p class="empty-state">No mappings configured</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sync Settings Section -->
+      <section class="section" id="settings-section">
+        <h2 class="section-title">Sync Settings</h2>
+
+        <div class="card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <label>Enable Sync</label>
+              <p class="setting-description">Automatically sync bookmarks with Raindrop.io</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="enable-sync">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <label for="sync-interval">Sync Interval</label>
+              <p class="setting-description">How often to check for changes in Raindrop.io</p>
+            </div>
+            <select id="sync-interval" class="select select-small">
+              <option value="1">Every 1 minute</option>
+              <option value="5">Every 5 minutes</option>
+              <option value="10">Every 10 minutes</option>
+              <option value="15">Every 15 minutes</option>
+              <option value="30">Every 30 minutes</option>
+              <option value="60">Every hour</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-info">
+              <label>Debug Mode</label>
+              <p class="setting-description">Enable detailed logging for troubleshooting</p>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="debug-mode">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="info-box">
+          <strong>Note:</strong> Raindrop.io is the source of truth. When conflicts occur,
+          Raindrop.io data will take priority.
+        </div>
+      </section>
+
+      <!-- Statistics Section -->
+      <section class="section" id="stats-section">
+        <h2 class="section-title">Statistics</h2>
+
+        <div class="card">
+          <div class="stats-grid">
+            <div class="stat-item">
+              <span class="stat-value" id="stat-total">0</span>
+              <span class="stat-label">Total Synced</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="stat-pending">0</span>
+              <span class="stat-label">Pending</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="stat-failed">0</span>
+              <span class="stat-label">Failed</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="stat-last-sync">Never</span>
+              <span class="stat-label">Last Sync</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="card-title">Actions</h3>
+          <div class="actions-grid">
+            <button id="sync-now-btn" class="btn btn-primary">
+              Sync Now
+            </button>
+            <button id="full-resync-btn" class="btn btn-secondary">
+              Full Resync
+            </button>
+            <button id="retry-failed-btn" class="btn btn-secondary">
+              Retry Failed
+            </button>
+            <button id="clear-errors-btn" class="btn btn-secondary">
+              Clear Errors
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Errors Section -->
+      <section class="section" id="errors-section">
+        <h2 class="section-title">Recent Errors</h2>
+        <div class="card">
+          <div id="errors-list" class="errors-list">
+            <p class="empty-state">No errors</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Raindrop Bookmark Sync v<span id="version">1.0.0</span></span>
+      <span class="separator">•</span>
+      <a href="https://raindrop.io" target="_blank" rel="noopener">Raindrop.io</a>
+    </footer>
+  </div>
+
+  <script src="../options.js"></script>
+</body>
+</html>
