@@ -50,7 +50,7 @@ Your Raindrop.io API token can be revoked at any time from [Raindrop.io Settings
 ## Contact
 
 If you have questions about this privacy policy, please open an issue at:
-https://github.com/victorkasap/raindrop-bookmark-sync/issues
+https://github.com/viktorkasap/raindrop-bookmark-sync/issues
 
 ## Changes to This Policy
 
