@@ -36,7 +36,10 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "raindrop-bookmark-sync@victorkasap",
-      "strict_min_version": "91.0"
+      "strict_min_version": "91.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   }
 }
