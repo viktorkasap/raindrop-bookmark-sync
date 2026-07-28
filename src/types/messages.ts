@@ -19,6 +19,5 @@ export interface SyncStatus {
   linksCount: number;
   lastSyncTime: number;
   lastSyncStatus: string;
-  pendingOperations: number;
   userName?: string;
 }

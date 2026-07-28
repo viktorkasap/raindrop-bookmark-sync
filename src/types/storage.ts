@@ -20,7 +20,6 @@ export interface FolderMapping {
   parentMappingId?: string; // for nested folders
   depth: number; // nesting level
   lastSync: number; // timestamp
-  syncChildren: boolean; // whether to sync nested folders
 }
 
 export interface BookmarkLink {
@@ -36,51 +35,28 @@ export interface BookmarkLink {
   errorMessage?: string;
 }
 
-export interface SyncQueue {
-  pending: SyncOperation[];
-  failed: SyncOperation[];
-}
-
-export interface SyncOperation {
-  id: string;
-  type: 'create' | 'update' | 'delete' | 'move';
-  source: 'firefox' | 'raindrop';
-  entityType: 'bookmark' | 'folder';
-  data: SyncOperationData;
-  timestamp: number;
-  retries: number;
-  maxRetries: number;
-  lastError?: string;
-}
-
-export interface SyncOperationData {
-  firefoxId?: string;
-  raindropId?: number;
-  url?: string;
-  title?: string;
-  collectionId?: number;
-  parentFolderId?: string;
-  oldCollectionId?: number;
-  newCollectionId?: number;
-  mappingId?: string;
-}
-
 export interface SyncStats {
   totalSynced: number;
-  pendingOperations: number;
-  failedOperations: number;
   lastSyncTime: number;
   lastSyncStatus: 'success' | 'partial' | 'failed' | 'never';
-  errors: SyncError[];
 }
 
-export interface SyncError {
-  timestamp: number;
-  operation: string;
+// Which reconcile operation an error came from (task 015). Closed set so a
+// typo can't ship and the UI can rely on the values.
+export type SyncErrorType =
+  | 'folder' // syncing the folder ↔ collection tree
+  | 'fetch' // reading a collection's raindrops
+  | 'sync' // reconciling a linked bookmark (push/pull/delete)
+  | 'create' // creating a bookmark or raindrop
+  | 'connection'; // the whole pass aborted (offline / server down / bad token)
+
+// One error from the last reconcile pass, shown in the Options errors panel as
+// "type — message". `message` is the human-readable description. Replaced
+// wholesale each pass, so the panel only ever shows the current state.
+export interface SyncErrorEntry {
+  type: SyncErrorType;
   message: string;
-  details?: string;
 }
-
 
 // Storage keys
 export const STORAGE_KEYS = {
@@ -88,8 +64,8 @@ export const STORAGE_KEYS = {
   SYNC_SETTINGS: 'sync_settings',
   FOLDER_MAPPINGS: 'folder_mappings',
   BOOKMARK_LINKS: 'bookmark_links',
-  SYNC_QUEUE: 'sync_queue',
   SYNC_STATS: 'sync_stats',
+  SYNC_ERRORS: 'sync_errors',
 } as const;
 
 // Default values
@@ -102,14 +78,6 @@ export const DEFAULT_SYNC_SETTINGS: SyncSettings = {
 
 export const DEFAULT_SYNC_STATS: SyncStats = {
   totalSynced: 0,
-  pendingOperations: 0,
-  failedOperations: 0,
   lastSyncTime: 0,
   lastSyncStatus: 'never',
-  errors: [],
-};
-
-export const DEFAULT_SYNC_QUEUE: SyncQueue = {
-  pending: [],
-  failed: [],
 };

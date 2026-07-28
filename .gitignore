@@ -26,4 +26,10 @@ npm-debug.log*
 .env
 .env.local
 
+# AI workspace (local-only: plans, tasks, state, logs)
 .ai/
+
+# Claude Code local config + hooks (work locally, not published)
+.claude/
+CLAUDE.local.md
+.mcp.json

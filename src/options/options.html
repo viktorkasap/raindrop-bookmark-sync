@@ -51,13 +51,13 @@
       <section class="section" id="mapping-section">
         <h2 class="section-title">Folder Mapping</h2>
         <p class="section-description">
-          Select which Firefox bookmark folders to sync with Raindrop.io collections.
+          Select which browser bookmark folders to sync with Raindrop.io collections.
         </p>
 
         <div class="card">
           <div class="mapping-form">
             <div class="form-group">
-              <label for="firefox-folder">Firefox Folder</label>
+              <label for="firefox-folder">Browser Folder</label>
               <select id="firefox-folder" class="select">
                 <option value="">Select a folder...</option>
               </select>
@@ -70,12 +70,10 @@
               </select>
             </div>
 
-            <div class="form-group checkbox-group">
-              <label class="checkbox-label">
-                <input type="checkbox" id="sync-children" checked>
-                <span>Sync nested folders</span>
-              </label>
-            </div>
+            <p class="form-hint">
+              The whole folder — including everything nested inside it — syncs
+              both ways with the collection.
+            </p>
 
             <button id="add-mapping-btn" class="btn btn-primary">
               Add Mapping
@@ -151,14 +149,6 @@
               <span class="stat-label">Total Synced</span>
             </div>
             <div class="stat-item">
-              <span class="stat-value" id="stat-pending">0</span>
-              <span class="stat-label">Pending</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-value" id="stat-failed">0</span>
-              <span class="stat-label">Failed</span>
-            </div>
-            <div class="stat-item">
               <span class="stat-value" id="stat-last-sync">Never</span>
               <span class="stat-label">Last Sync</span>
             </div>
@@ -174,23 +164,35 @@
             <button id="full-resync-btn" class="btn btn-secondary">
               Full Resync
             </button>
-            <button id="retry-failed-btn" class="btn btn-secondary">
-              Retry Failed
-            </button>
-            <button id="clear-errors-btn" class="btn btn-secondary">
-              Clear Errors
-            </button>
           </div>
+          <div class="action-hints">
+            <p class="action-hint">
+              <strong>Sync Now</strong> — check both sides right now and apply
+              anything that changed since the last sync. Sync also runs on its
+              own in the background; this just does it immediately.
+            </p>
+            <p class="action-hint">
+              <strong>Full Resync</strong> — rebuild all the links from scratch,
+              re-matching every bookmark to its Raindrop by web address. Use it
+              if the browser and Raindrop look out of step. Slower, and safe: on
+              a fresh match it merges the two sides, it won't delete anything.
+            </p>
+          </div>
+          <p id="sync-status-msg" class="sync-status-msg" role="status" aria-live="polite"></p>
         </div>
       </section>
 
-      <!-- Errors Section -->
-      <section class="section" id="errors-section">
-        <h2 class="section-title">Recent Errors</h2>
+      <!-- Sync Errors Section -->
+      <section class="section" id="sync-errors-section">
+        <h2 class="section-title">Sync errors</h2>
         <div class="card">
-          <div id="errors-list" class="errors-list">
+          <div id="sync-errors-list" class="sync-errors-list" aria-live="polite">
             <p class="empty-state">No errors</p>
           </div>
+          <p class="action-hint">
+            Shows problems from the most recent sync only. The list clears
+            itself after a successful sync — there's nothing to clear by hand.
+          </p>
         </div>
       </section>
     </main>

@@ -1,17 +1,15 @@
 // Firefox Bookmark Event Listeners
 
 import browser, { Bookmarks } from 'webextension-polyfill';
-import { SyncOperation } from '../types/storage';
 import {
   getSettings,
   findMappingByFirefoxId,
   findBookmarkLink,
-  findBookmarkLinkByUrl,
-  addToQueue,
   isAuthenticated,
 } from './storage';
 import { logger } from '../utils/logger';
-import { generateId, computeBookmarkHash, isValidSyncUrl } from '../utils/hash';
+import { computeBookmarkHash, isValidSyncUrl } from '../utils/hash';
+import { isBookmarkNode } from '../utils/bookmarkNode';
 
 // Track operations to avoid duplicates during sync
 // Uses a depth counter instead of boolean to handle concurrent syncs correctly:
@@ -31,28 +29,36 @@ export function isSyncInProgress(): boolean {
   return syncDepth > 0;
 }
 
-// Per-key queue batching: accumulates operations by firefoxId,
-// keeping only the latest operation per bookmark. Flushes after 300ms pause.
-// This prevents losing events when multiple bookmarks change rapidly.
-const pendingOperations = new Map<string, SyncOperation>();
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+// ==================== Debounced reconcile trigger (task 014) ====================
 
-function scheduleQueueFlush(): void {
-  if (flushTimer) return;
-  flushTimer = setTimeout(async () => {
-    flushTimer = null;
-    const operations = Array.from(pendingOperations.values());
-    pendingOperations.clear();
-    for (const op of operations) {
-      await addToQueue(op);
-    }
-  }, 300);
+// One debounced trigger for every relevant bookmark event. The event itself
+// carries no payload anymore — reconcile re-derives everything from the
+// three-way diff. Trailing debounce: a burst (import, drag of many) collapses
+// into one pass. If the MV3 SW dies before the timer fires, the periodic alarm
+// reconcile catches up (same guarantee the old queue had).
+const RECONCILE_DEBOUNCE_MS = 800;
+let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleReconcile(): void {
+  if (reconcileTimer) clearTimeout(reconcileTimer);
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = null;
+    // Dynamic import breaks the module cycle (syncManager imports setSyncing).
+    void import('./syncManager')
+      .then((m) => m.reconcileAllMappings())
+      .catch((error) => logger.error('Debounced reconcile failed', error));
+  }, RECONCILE_DEBOUNCE_MS);
 }
 
-function batchAddToQueue(operation: SyncOperation): void {
-  const key = operation.data.firefoxId || operation.id;
-  pendingOperations.set(key, operation);
-  scheduleQueueFlush();
+// Shared cheap gate for every handler: never react to our own sync writes, and
+// only when connected + auto-sync on.
+async function syncActive(): Promise<boolean> {
+  if (isSyncInProgress()) return false;
+  const [authenticated, settings] = await Promise.all([
+    isAuthenticated(),
+    getSettings(),
+  ]);
+  return authenticated && settings.enabled;
 }
 
 // ==================== Event Listeners ====================
@@ -61,291 +67,126 @@ async function handleBookmarkCreated(
   id: string,
   bookmark: Bookmarks.BookmarkTreeNode
 ): Promise<void> {
-  // Skip if syncing is in progress (to avoid loops)
-  if (isSyncInProgress()) {
-    logger.debug('Skipping bookmark created event during sync');
-    return;
-  }
+  if (isSyncInProgress()) return;
+  if (!isBookmarkNode(bookmark)) return;
+  if (!isValidSyncUrl(bookmark.url!)) return;
+  if (!(await syncActive())) return;
 
-  // Skip folders and separators
-  // In Chrome, type may be undefined for bookmarks - they have url property instead
-  // In Firefox, type is 'bookmark' for bookmarks and 'folder' for folders
-  const isBookmark = bookmark.url && (bookmark.type === 'bookmark' || bookmark.type === undefined);
-  if (!isBookmark) {
-    logger.debug('Skipping non-bookmark item', { type: bookmark.type, hasUrl: !!bookmark.url });
-    return;
-  }
-
-  // Skip internal browser URLs (about:, chrome:, etc.)
-  if (!isValidSyncUrl(bookmark.url!)) {
-    logger.debug(`Skipping invalid URL: ${bookmark.url}`);
-    return;
-  }
-
-  // Check auth and settings
-  const authenticated = await isAuthenticated();
-  const settings = await getSettings();
-  if (!authenticated || !settings.enabled) {
-    logger.debug('Sync is disabled or not authenticated, skipping');
-    return;
-  }
-
-  // Check if bookmark is in a synced folder
   const parentId = bookmark.parentId;
-  if (!parentId) {
-    logger.debug('Bookmark has no parent');
+  if (!parentId) return;
+  if (!(await hasSyncedAncestor(parentId))) {
+    logger.debug('Created bookmark has no synced ancestor, ignoring');
     return;
   }
 
-  const mapping = await findMappingByFirefoxId(parentId);
-  if (!mapping) {
-    logger.debug('Parent folder is not synced');
-    return;
-  }
-
-  // Check if this bookmark was already synced (e.g., created by pull sync).
-  // This prevents duplicates when the onCreated event fires after setSyncing(false).
-  // Check both by firefoxId AND by URL — in Chrome MV3 the Service Worker can be
-  // killed between bookmark creation and link saving, losing the firefoxId link.
-  const existingLink = await findBookmarkLink(id);
-  if (existingLink) {
-    logger.debug('Link already exists for this bookmark, skipping create event');
-    return;
-  }
-  const existingLinkByUrl = await findBookmarkLinkByUrl(bookmark.url!);
-  if (existingLinkByUrl) {
-    logger.debug('Link already exists for this URL, skipping create event');
-    return;
-  }
-
-  logger.info(`Bookmark created in synced folder: ${bookmark.title}`);
-
-  const operation: SyncOperation = {
-    id: generateId(),
-    type: 'create',
-    source: 'firefox',
-    entityType: 'bookmark',
-    data: {
-      firefoxId: id,
-      url: bookmark.url,
-      title: bookmark.title,
-      collectionId: mapping.raindropCollectionId,
-      mappingId: mapping.id,
-    },
-    timestamp: Date.now(),
-    retries: 0,
-    maxRetries: 3,
-  };
-
-  batchAddToQueue(operation);
+  logger.info(`Bookmark created in synced tree: ${bookmark.title}`);
+  scheduleReconcile();
 }
 
 async function handleBookmarkRemoved(
   id: string,
-  removeInfo: Bookmarks.OnRemovedRemoveInfoType
+  _removeInfo: Bookmarks.OnRemovedRemoveInfoType
 ): Promise<void> {
-  // Skip if syncing is in progress
-  if (isSyncInProgress()) {
-    logger.debug('Skipping bookmark removed event during sync');
-    return;
-  }
+  if (!(await syncActive())) return;
 
-  // Check auth and settings
-  const authenticated = await isAuthenticated();
-  const settings = await getSettings();
-  if (!authenticated || !settings.enabled) {
-    return;
-  }
-
-  // Find the bookmark link
+  // Relevant if a linked bookmark, or a mapped folder itself, was removed.
   const link = await findBookmarkLink(id);
-  if (!link) {
-    logger.debug('No link found for removed bookmark');
+  const mapping = link ? null : await findMappingByFirefoxId(id);
+  if (!link && !mapping) {
+    logger.debug('Removed node is neither linked nor a mapped folder, ignoring');
     return;
   }
 
-  logger.info(`Bookmark removed: ${link.title}`);
-
-  const operation: SyncOperation = {
-    id: generateId(),
-    type: 'delete',
-    source: 'firefox',
-    entityType: 'bookmark',
-    data: {
-      firefoxId: id,
-      raindropId: link.raindropId,
-      mappingId: link.mappingId,
-    },
-    timestamp: Date.now(),
-    retries: 0,
-    maxRetries: 3,
-  };
-
-  batchAddToQueue(operation);
+  logger.info(`Removal in synced scope: ${link?.title ?? mapping?.folderName}`);
+  scheduleReconcile();
 }
 
 async function handleBookmarkChanged(
   id: string,
   changeInfo: Bookmarks.OnChangedChangeInfoType
 ): Promise<void> {
-  // Skip if syncing is in progress
-  if (isSyncInProgress()) {
-    logger.debug('Skipping bookmark changed event during sync');
-    return;
-  }
+  if (!(await syncActive())) return;
 
-  // Check auth and settings
-  const authenticated = await isAuthenticated();
-  const settings = await getSettings();
-  if (!authenticated || !settings.enabled) {
-    return;
-  }
-
-  // Find the bookmark link
   const link = await findBookmarkLink(id);
-  if (!link) {
-    logger.debug('No link found for changed bookmark');
+  if (link) {
+    // Skip a no-op change (content hash unchanged) — avoids a pointless pass.
+    const newTitle = changeInfo.title || link.title;
+    const newUrl = changeInfo.url || link.url;
+    if (computeBookmarkHash(newUrl, newTitle) === link.contentHash) {
+      logger.debug('Content hash unchanged, ignoring change event');
+      return;
+    }
+    logger.info(`Bookmark changed: ${newTitle}`);
+    scheduleReconcile();
     return;
   }
 
-  // Check if content actually changed
-  const newTitle = changeInfo.title || link.title;
-  const newUrl = changeInfo.url || link.url;
-  const newHash = computeBookmarkHash(newUrl, newTitle);
-
-  if (newHash === link.contentHash) {
-    logger.debug('Content hash unchanged, skipping');
-    return;
+  // A mapped folder rename (onChanged fires with the new title). Reconcile's
+  // three-way rename handles it; the periodic pass also detects renames, so
+  // this is a best-effort fast path.
+  if (await findMappingByFirefoxId(id)) {
+    logger.info('Mapped folder renamed');
+    scheduleReconcile();
   }
+}
 
-  logger.info(`Bookmark changed: ${newTitle}`);
+// Walk up the browser folder tree from `folderId`, returning true as soon as an
+// ancestor (or the folder itself) is a mapped, synced folder. Used to tell an
+// intra-tree move/create inside a not-yet-mapped subfolder from a genuine one
+// outside every synced tree. Capped by MAX_ANCESTOR_WALK against a pathological
+// tree.
+//
+// The cap is intentionally independent of (and looser than) syncManager's
+// MAX_SYNC_DEPTH — importing that constant here would create a module cycle
+// (syncManager already imports setSyncing from this file). A subfolder deeper
+// than MAX_SYNC_DEPTH is never mapped by reconcile anyway, so deferring its
+// handling only means the raindrop lingers in the old collection (data
+// preserved) rather than being deleted+recreated with a new _id — the safer
+// failure for a depth no realistic tree reaches.
+const MAX_ANCESTOR_WALK = 50;
 
-  const operation: SyncOperation = {
-    id: generateId(),
-    type: 'update',
-    source: 'firefox',
-    entityType: 'bookmark',
-    data: {
-      firefoxId: id,
-      raindropId: link.raindropId,
-      url: newUrl,
-      title: newTitle,
-      mappingId: link.mappingId,
-    },
-    timestamp: Date.now(),
-    retries: 0,
-    maxRetries: 3,
-  };
-
-  batchAddToQueue(operation);
+async function hasSyncedAncestor(folderId: string): Promise<boolean> {
+  let currentId: string | undefined = folderId;
+  for (let i = 0; i < MAX_ANCESTOR_WALK && currentId; i++) {
+    if (await findMappingByFirefoxId(currentId)) {
+      return true;
+    }
+    try {
+      const [node] = await browser.bookmarks.get(currentId);
+      currentId = node?.parentId;
+    } catch {
+      // Can't verify ancestry → fail closed: assume in-tree and reconcile. A
+      // missed sync is recoverable on a later pass; a wrong skip could drop a
+      // move that should have propagated.
+      return true;
+    }
+  }
+  return false;
 }
 
 async function handleBookmarkMoved(
   id: string,
   moveInfo: Bookmarks.OnMovedMoveInfoType
 ): Promise<void> {
-  // Skip if syncing is in progress
-  if (isSyncInProgress()) {
-    logger.debug('Skipping bookmark moved event during sync');
-    return;
-  }
+  if (!(await syncActive())) return;
 
-  // Check auth and settings
-  const authenticated = await isAuthenticated();
-  const settings = await getSettings();
-  if (!authenticated || !settings.enabled) {
-    return;
-  }
-
-  const oldParentMapping = await findMappingByFirefoxId(moveInfo.oldParentId);
-  const newParentMapping = await findMappingByFirefoxId(moveInfo.parentId);
-
-  // Find the bookmark link
+  // Relevant if the bookmark is already linked, or either end of the move is
+  // within a synced tree. Reconcile re-derives the actual push/pull/move/delete
+  // (including "moved out of scope → delete the raindrop") from the diff — the
+  // event only decides whether a pass is worth running.
   const link = await findBookmarkLink(id);
-
-  if (!oldParentMapping && !newParentMapping) {
-    // Neither folder is synced, ignore
-    logger.debug('Neither old nor new parent is synced');
+  if (link) {
+    scheduleReconcile();
     return;
   }
-
-  if (oldParentMapping && !newParentMapping) {
-    // Moved OUT of synced folder - delete from Raindrop
-    if (link) {
-      logger.info(`Bookmark moved out of synced folder: ${link.title}`);
-
-      const operation: SyncOperation = {
-        id: generateId(),
-        type: 'delete',
-        source: 'firefox',
-        entityType: 'bookmark',
-        data: {
-          firefoxId: id,
-          raindropId: link.raindropId,
-          mappingId: oldParentMapping.id,
-        },
-        timestamp: Date.now(),
-        retries: 0,
-        maxRetries: 3,
-      };
-
-      batchAddToQueue(operation);
-    }
-  } else if (!oldParentMapping && newParentMapping) {
-    // Moved INTO synced folder - create in Raindrop
-    try {
-      const [bookmark] = await browser.bookmarks.get(id);
-
-      if (bookmark.url) {
-        logger.info(`Bookmark moved into synced folder: ${bookmark.title}`);
-
-        const operation: SyncOperation = {
-          id: generateId(),
-          type: 'create',
-          source: 'firefox',
-          entityType: 'bookmark',
-          data: {
-            firefoxId: id,
-            url: bookmark.url,
-            title: bookmark.title,
-            collectionId: newParentMapping.raindropCollectionId,
-            mappingId: newParentMapping.id,
-          },
-          timestamp: Date.now(),
-          retries: 0,
-          maxRetries: 3,
-        };
-
-        batchAddToQueue(operation);
-      }
-    } catch (error) {
-      logger.error('Failed to get moved bookmark details', error);
-    }
-  } else if (oldParentMapping && newParentMapping) {
-    // Moved between synced folders - update collection
-    if (link) {
-      logger.info(`Bookmark moved between synced folders: ${link.title}`);
-
-      const operation: SyncOperation = {
-        id: generateId(),
-        type: 'move',
-        source: 'firefox',
-        entityType: 'bookmark',
-        data: {
-          firefoxId: id,
-          raindropId: link.raindropId,
-          oldCollectionId: oldParentMapping.raindropCollectionId,
-          newCollectionId: newParentMapping.raindropCollectionId,
-          mappingId: newParentMapping.id,
-        },
-        timestamp: Date.now(),
-        retries: 0,
-        maxRetries: 3,
-      };
-
-      batchAddToQueue(operation);
-    }
+  if (
+    (await hasSyncedAncestor(moveInfo.oldParentId)) ||
+    (await hasSyncedAncestor(moveInfo.parentId))
+  ) {
+    scheduleReconcile();
+    return;
   }
+  logger.debug('Move touches no synced tree, ignoring');
 }
 
 // ==================== Listener Management ====================
@@ -377,7 +218,16 @@ export function unregisterBookmarkListeners(): void {
   browser.bookmarks.onChanged.removeListener(handleBookmarkChanged);
   browser.bookmarks.onMoved.removeListener(handleBookmarkMoved);
 
+  // Cancel any armed reconcile. Every teardown path (disable auto-sync,
+  // disconnect/blank-slate, last mapping removed) calls this, so a pending
+  // timer must not fire afterwards: reconcileAllMappings has no enabled gate,
+  // so a late pass would push/pull after the user disabled sync (task 007) or
+  // write into freshly-wiped storage after disconnect (task 011).
+  if (reconcileTimer) {
+    clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
+
   listenersRegistered = false;
   logger.info('Bookmark listeners unregistered');
 }
-

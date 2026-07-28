@@ -6,14 +6,11 @@ import {
   SyncSettings,
   FolderMapping,
   BookmarkLink,
-  SyncQueue,
-  SyncOperation,
   SyncStats,
-  SyncError,
+  SyncErrorEntry,
   STORAGE_KEYS,
   DEFAULT_SYNC_SETTINGS,
   DEFAULT_SYNC_STATS,
-  DEFAULT_SYNC_QUEUE,
 } from '../types/storage';
 import { logger } from '../utils/logger';
 
@@ -58,6 +55,27 @@ export async function getApiToken(): Promise<string | null> {
     logger.error('Failed to get API token', error);
     return null;
   }
+}
+
+/**
+ * Disconnect = blank slate. Wipes ALL extension-owned local storage — token,
+ * mappings, bookmark links, settings, queue, stats, and the transient queue
+ * lock — so a disconnect is a full teardown of the extension's state (task
+ * 011). The user's real data is untouched: browser bookmark folders and
+ * Raindrop collections live outside `storage.local` and are the user's
+ * responsibility, consistent with the "remove mapping ≠ delete data" model.
+ *
+ * Callers must quiesce background writers first (stop the queue processor,
+ * unregister listeners, clear alarms) — that is what actually prevents a key
+ * being resurrected after the clear, since most mutators write storage.local
+ * directly rather than through this lock. The storageLock.run wrapper only
+ * orders this against the link/queue mutators that do use it.
+ */
+export async function resetLocalState(): Promise<void> {
+  await storageLock.run(async () => {
+    await browser.storage.local.clear();
+    logger.info('Extension local state reset (disconnect)');
+  });
 }
 
 export async function clearApiToken(): Promise<void> {
@@ -134,6 +152,25 @@ export async function getFolderMappings(): Promise<FolderMapping[]> {
     logger.error('Failed to get folder mappings', error);
     return [];
   }
+}
+
+/**
+ * With no folder mappings there is nothing to sync, so auto-sync must not stay
+ * on (task 012 — "no mapping, no sync"). Called after a mapping is removed:
+ * when the last one is gone, force `enabled` off. Returns true only when it
+ * actually flipped enabled from on to off, so the caller can tear down the
+ * auto-sync services. No-op when a mapping still exists or sync is already off.
+ */
+export async function disableAutoSyncIfNoMappings(): Promise<boolean> {
+  const mappings = await getFolderMappings();
+  if (mappings.length > 0) return false;
+
+  const settings = await getSettings();
+  if (!settings.enabled) return false;
+
+  await updateSettings({ enabled: false });
+  logger.info('No folder mappings left — auto-sync disabled');
+  return true;
 }
 
 export async function addFolderMapping(
@@ -298,6 +335,18 @@ export async function removeBookmarkLink(linkId: string): Promise<void> {
   });
 }
 
+export async function removeBookmarkLinksForMapping(
+  mappingId: string
+): Promise<void> {
+  return storageLock.run(async () => {
+    const links = await getBookmarkLinks();
+    const filtered = links.filter((l) => l.mappingId !== mappingId);
+    if (filtered.length !== links.length) {
+      await _saveBookmarkLinks(filtered);
+    }
+  });
+}
+
 export async function findBookmarkLink(
   firefoxId?: string,
   raindropId?: number
@@ -329,114 +378,6 @@ export async function getBookmarkLinksForMapping(
 ): Promise<BookmarkLink[]> {
   const links = await getBookmarkLinks();
   return links.filter((l) => l.mappingId === mappingId);
-}
-
-// ==================== Sync Queue ====================
-
-export async function getQueue(): Promise<SyncQueue> {
-  try {
-    const result = await browser.storage.local.get(STORAGE_KEYS.SYNC_QUEUE);
-    return (result[STORAGE_KEYS.SYNC_QUEUE] as SyncQueue) || DEFAULT_SYNC_QUEUE;
-  } catch (error) {
-    logger.error('Failed to get sync queue', error);
-    return { ...DEFAULT_SYNC_QUEUE };
-  }
-}
-
-// Internal save — no lock, used by functions that already hold storageLock
-async function _saveQueue(queue: SyncQueue): Promise<void> {
-  try {
-    await browser.storage.local.set({
-      [STORAGE_KEYS.SYNC_QUEUE]: queue,
-    });
-  } catch (error) {
-    logger.error('Failed to save sync queue', error);
-    throw error;
-  }
-}
-
-// External save — acquires lock, safe for callers outside storageLock
-export async function saveQueue(queue: SyncQueue): Promise<void> {
-  return storageLock.run(() => _saveQueue(queue));
-}
-
-export async function addToQueue(operation: SyncOperation): Promise<void> {
-  return storageLock.run(async () => {
-    const queue = await getQueue();
-
-    // Check for duplicate operations
-    const exists = queue.pending.find(
-      (op) =>
-        op.type === operation.type &&
-        op.source === operation.source &&
-        op.data.firefoxId === operation.data.firefoxId &&
-        op.data.raindropId === operation.data.raindropId
-    );
-
-    if (!exists) {
-      queue.pending.push(operation);
-      await _saveQueue(queue);
-      logger.debug('Operation added to queue', { operation });
-    }
-  });
-}
-
-export async function removeFromQueue(operationId: string): Promise<void> {
-  return storageLock.run(async () => {
-    const queue = await getQueue();
-    queue.pending = queue.pending.filter((op) => op.id !== operationId);
-    queue.failed = queue.failed.filter((op) => op.id !== operationId);
-    await _saveQueue(queue);
-  });
-}
-
-const MAX_FAILED_QUEUE = 100;
-
-export async function moveToFailed(
-  operationId: string,
-  errorMessage: string
-): Promise<void> {
-  return storageLock.run(async () => {
-    const queue = await getQueue();
-    const operation = queue.pending.find((op) => op.id === operationId);
-
-    if (operation) {
-      operation.retries += 1;
-      operation.lastError = errorMessage;
-
-      if (operation.retries >= operation.maxRetries) {
-        queue.pending = queue.pending.filter((op) => op.id !== operationId);
-        queue.failed.push(operation);
-
-        // Trim oldest failed operations if over limit
-        if (queue.failed.length > MAX_FAILED_QUEUE) {
-          queue.failed = queue.failed.slice(-MAX_FAILED_QUEUE);
-        }
-
-        logger.warn('Operation moved to failed queue', { operation });
-      }
-
-      await _saveQueue(queue);
-    }
-  });
-}
-
-export async function clearQueue(): Promise<void> {
-  await saveQueue({ pending: [], failed: [] });
-}
-
-export async function retryFailed(): Promise<void> {
-  const queue = await getQueue();
-
-  // Move failed operations back to pending with reset retries
-  for (const op of queue.failed) {
-    op.retries = 0;
-    op.lastError = undefined;
-    queue.pending.push(op);
-  }
-
-  queue.failed = [];
-  await saveQueue(queue);
 }
 
 // ==================== Sync Stats ====================
@@ -480,21 +421,33 @@ export async function updateSyncStats(
   }
 }
 
-export async function addSyncError(error: SyncError): Promise<void> {
-  const stats = await getSyncStats();
+// ==================== Sync Errors (inline, task 015) ====================
 
-  // Keep only last 50 errors
-  stats.errors.unshift(error);
-  if (stats.errors.length > 50) {
-    stats.errors = stats.errors.slice(0, 50);
+// The errors from the LAST reconcile pass, replaced wholesale on every pass
+// (clean pass → []). The Options page renders each entry inline next to the
+// mapping it happened under. Capped so a pathological pass can't bloat storage.
+const MAX_SYNC_ERRORS = 50;
+
+export async function getSyncErrors(): Promise<SyncErrorEntry[]> {
+  try {
+    const result = await browser.storage.local.get(STORAGE_KEYS.SYNC_ERRORS);
+    return (result[STORAGE_KEYS.SYNC_ERRORS] as SyncErrorEntry[]) || [];
+  } catch (error) {
+    logger.error('Failed to get sync errors', error);
+    return [];
   }
-
-  await updateSyncStats(stats);
 }
 
-export async function clearSyncErrors(): Promise<void> {
-  await updateSyncStats({ errors: [] });
+export async function setSyncErrors(errors: SyncErrorEntry[]): Promise<void> {
+  try {
+    await browser.storage.local.set({
+      [STORAGE_KEYS.SYNC_ERRORS]: errors.slice(0, MAX_SYNC_ERRORS),
+    });
+  } catch (error) {
+    logger.error('Failed to set sync errors', error);
+  }
 }
+
 
 // ==================== Utility Functions ====================
 

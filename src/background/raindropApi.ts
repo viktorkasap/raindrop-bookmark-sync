@@ -175,9 +175,13 @@ export async function getChildCollections(): Promise<Collection[]> {
 }
 
 export async function getAllCollections(): Promise<Collection[]> {
+  // Do NOT swallow a childrens failure: callers (reconcileFolderTree) treat
+  // absence from this list as "collection deleted" and resurrect — a partial
+  // list would mass-create duplicate collections. An account with zero child
+  // collections still returns result:true with an empty items array.
   const [root, children] = await Promise.all([
     getRootCollections(),
-    getChildCollections().catch(() => []), // childrens may be empty
+    getChildCollections(),
   ]);
 
   // Deduplicate by _id

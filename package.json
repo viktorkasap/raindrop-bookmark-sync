@@ -13,7 +13,9 @@
     "lint": "web-ext lint --source-dir=dist/firefox",
     "package:firefox": "web-ext build --source-dir=dist/firefox --overwrite-dest --artifacts-dir=web-ext-artifacts/firefox",
     "package:chrome": "web-ext build --source-dir=dist/chrome --overwrite-dest --artifacts-dir=web-ext-artifacts/chrome",
-    "package:all": "npm run build:all && npm run package:firefox && npm run package:chrome"
+    "package:all": "npm run build:all && npm run package:firefox && npm run package:chrome",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/webextension-polyfill": "^0.12.4",
@@ -23,6 +25,7 @@
     "mini-css-extract-plugin": "^2.8.0",
     "ts-loader": "^9.5.1",
     "typescript": "^5.3.3",
+    "vitest": "^4.1.9",
     "web-ext": "^9.3.0",
     "webpack": "^5.90.1",
     "webpack-cli": "^5.1.4"

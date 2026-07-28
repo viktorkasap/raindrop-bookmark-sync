@@ -19,7 +19,6 @@ const userNameEl = document.getElementById('user-name')!;
 const syncStatusEl = document.getElementById('sync-status')!;
 const mappingsCountEl = document.getElementById('mappings-count')!;
 const linksCountEl = document.getElementById('links-count')!;
-const pendingCountEl = document.getElementById('pending-count')!;
 const lastSyncEl = document.getElementById('last-sync')!;
 const syncToggle = document.getElementById('sync-toggle') as HTMLInputElement;
 const syncNowBtn = document.getElementById('sync-now-btn') as HTMLButtonElement;
@@ -84,7 +83,6 @@ function showAuthenticatedUI(status: SyncStatus): void {
   // Update counts
   mappingsCountEl.textContent = status.mappingsCount.toString();
   linksCountEl.textContent = status.linksCount.toString();
-  pendingCountEl.textContent = status.pendingOperations.toString();
 
   // Update last sync time
   if (status.lastSyncTime > 0) {
@@ -93,8 +91,12 @@ function showAuthenticatedUI(status: SyncStatus): void {
     lastSyncEl.textContent = 'Never';
   }
 
-  // Update toggle
-  syncToggle.checked = status.isEnabled;
+  // Update toggle. No mapping, no sync (task 012): with nothing mapped there is
+  // nothing to sync, so the toggle is disabled and reads OFF — matching the
+  // options page and the backend guard that refuses to enable sync at 0 mappings.
+  const hasMappings = status.mappingsCount > 0;
+  syncToggle.disabled = !hasMappings;
+  syncToggle.checked = status.isEnabled && hasMappings;
 }
 
 // Update sync status badge
@@ -141,15 +143,29 @@ function setupEventListeners(): void {
     browser.runtime.openOptionsPage();
   });
 
-  // Disconnect button
+  // Disconnect button — two-click confirm instead of a blocking confirm().
+  // First click arms (swaps the label for ~3s); a second click disconnects.
+  let disconnectArmTimer: ReturnType<typeof setTimeout> | undefined;
   disconnectBtn.addEventListener('click', async () => {
-    if (confirm('Are you sure you want to disconnect?')) {
-      try {
-        await sendMessage('logout');
-        await updateUI();
-      } catch {
-        // Failed to disconnect — UI will reflect the state on next update
-      }
+    if (!disconnectArmTimer) {
+      disconnectBtn.dataset.armLabel = disconnectBtn.textContent ?? '';
+      disconnectBtn.textContent = 'Click again to disconnect';
+      disconnectArmTimer = setTimeout(() => {
+        disconnectBtn.textContent = disconnectBtn.dataset.armLabel ?? '';
+        delete disconnectBtn.dataset.armLabel;
+        disconnectArmTimer = undefined;
+      }, 3000);
+      return;
+    }
+    clearTimeout(disconnectArmTimer);
+    disconnectArmTimer = undefined;
+    disconnectBtn.textContent = disconnectBtn.dataset.armLabel ?? '';
+    delete disconnectBtn.dataset.armLabel;
+    try {
+      await sendMessage('logout');
+      await updateUI();
+    } catch {
+      // Failed to disconnect — UI will reflect the state on next update
     }
   });
 

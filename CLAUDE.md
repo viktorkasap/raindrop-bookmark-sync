@@ -2,19 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Session start protocol (read first)
+## Branching workflow
 
-This project tracks ongoing work in a local, gitignored `.ai/` folder so sessions are resumable across context resets. At the start of any work session:
+Integration-branch model (simplified git-flow):
 
-1. Read `.ai/STATE.md` — current focus, where the last session stopped, next step.
-2. Read `.ai/PLAN.md` for the roadmap, then open the active `.ai/tasks/NNN-*.md` named in STATE.
-3. Work from the task's `Steps` checklist.
+- `main` — release branch. Always stable. Only receives merges from `develop`, **squashed**, after the extension is tested in a browser. Store builds are cut from here.
+- `develop` — integration branch. Feature branches merge here (regular merge, history preserved) and are tested together.
+- `feature/NNN-name` — one per task, branched from `develop`, named after the task it implements. Merged into `develop`, then deleted.
 
-While working, keep `.ai/` as the source of truth — not the chat:
-- Tick checkboxes in the task file as steps land; record any decision that affects code in the task's `Notes` (or `.ai/log/YYYY-MM-DD.md`).
-- **Before stopping (or when context runs low), update `.ai/STATE.md`** so a fresh session can resume seamlessly. Fix often, in small increments — not one big dump at the end.
-
-See `.ai/README.md` for the full convention.
+Per-task flow: `git switch develop` → `git switch -c feature/NNN-name` → work → merge into `develop` → test in browser → (when `develop` is stable) squash-merge `develop` into `main`. Never commit directly to `main`. Commit/push only when the user asks.
 
 ## What this is
 
@@ -43,21 +39,22 @@ To load manually: Firefox → `about:debugging` → Load Temporary Add-on → `d
 
 All real logic lives in the background script (`src/background/`). The popup and options pages are thin UIs that talk to it exclusively via `browser.runtime.sendMessage`. The single message switch in `src/background/index.ts:handleMessage` is the entry point for every UI action — to add a feature, add a `case` there plus a matching action string in `src/types/messages.ts`.
 
-Two-way sync flows through two distinct paths:
+Both directions flow through **one three-way reconcile** (`syncManager.ts:reconcileAllMappings`), driven by two triggers:
 
-- **Browser → Raindrop (push):** `bookmarkListeners.ts` listens to `bookmarks.onCreated/onRemoved/onChanged/onMoved`, builds a `SyncOperation`, and enqueues it. `queue.ts` (`queueProcessor`) drains the queue and calls the Raindrop API. Real-time.
-- **Raindrop → Browser (pull):** `syncManager.ts:pullFromRaindrop` runs on an alarm (`raindrop-sync-interval`, configurable 1–60 min), diffs each collection against local state, and creates/updates/deletes browser bookmarks. Polling.
+- **Real-time:** `bookmarkListeners.ts` listens to `bookmarks.onCreated/onRemoved/onChanged/onMoved`. Each handler runs cheap relevance guards and, if relevant, arms an 800 ms trailing-debounce timer (`scheduleReconcile`) that dynamically `import('./syncManager')` and calls `reconcileAllMappings()`. Events carry **no payload** — reconcile re-derives everything from the diff. A burst (bulk import, multi-drag) collapses into one pass.
+- **Periodic:** the `raindrop-sync-interval` alarm (configurable 1–60 min) calls the same `reconcileAllMappings()`, catching up either direction — including anything a real-time trigger missed (e.g. the MV3 SW died before the debounce fired).
 
-**`syncManager.ts` is the core.** It owns initial sync (URL-matching existing bookmarks ↔ raindrops), pull/push diffing, nested-folder mirroring (`syncFolderWithChildren`, creates Raindrop collections to match folder trees, depth-capped at `MAX_SYNC_DEPTH`), and full re-sync.
+**`reconcileAllMappings` is the core.** For every `BookmarkLink` (the baseline) it compares the browser side and the Raindrop side against the last-synced `contentHash`/`mappingId` and derives a direction via the pure decision module `reconcile.ts` (`decideBookmarkAction`): push / pull / delete-in-raindrop / delete-in-browser / drop-link; both-changed → Raindrop wins. No baseline → union (create/adopt by URL, **never delete**). It also owns nested-folder mirroring (`reconcileFolderTree` / `syncFolderWithChildren`, creates Raindrop collections to match folder trees, depth-capped at `MAX_SYNC_DEPTH`), bidirectional folder rename (`decideRenameAction`), and full re-sync (one global union pass). It holds a stale-tolerant `reconcile_lock` in `storage.local` (5-min timeout) so only one pass runs at a time across SW restarts.
 
 ### Loop prevention (the central design problem)
 
-Sync writes bookmarks, which fire bookmark events, which would enqueue more sync operations — an infinite loop. Defenses, all of which must be preserved when editing sync code:
+Sync writes bookmarks, which fire bookmark events, which would trigger more reconciles — an infinite loop. Defenses, all of which must be preserved when editing sync code:
 
-- `setSyncing(true/false)` in `bookmarkListeners.ts` maintains a **depth counter** (`syncDepth`, not a boolean — handles concurrent syncs). All event handlers bail early when `isSyncInProgress()`. Every sync function wraps its body in `setSyncing(true)` … `finally setSyncing(false)`.
+- `setSyncing(true/false)` in `bookmarkListeners.ts` maintains a **depth counter** (`syncDepth`, not a boolean — handles concurrent syncs). All event handlers bail early when `isSyncInProgress()`. `reconcileAllMappings` wraps its body in `setSyncing(true)` … `finally setSyncing(false)`.
+- **Baseline idempotency**: reconcile decisions compare each side to the `BookmarkLink` baseline, so once a pass has written both sides and updated the baseline, a re-run computes `none` for everything — a self-triggered event finds nothing to do. (This replaces the old queue's per-op `BookmarkLink` re-checks.)
 - **Content hashing** (`utils/hash.ts`): `computeBookmarkHash`/`computeRaindropHash` over normalized-URL + title. Changes are skipped when the hash is unchanged. `normalizeUrl` strips tracking params, sorts query params, lowercases host — so trivially different URLs match.
-- **URL-level dedup in pull** (`pullSyncForMapping`): if an incoming raindrop's normalized URL is already linked under any mapping, it's skipped even if the raindrop `_id` is new. This stops the create→event→duplicate-raindrop→pull-sees-new feedback loop.
-- Queue create/pull handlers re-check for an existing `BookmarkLink` before acting.
+- **URL-level dedup** in reconcile's union phases: an unlinked raindrop whose normalized URL is already linked under any mapping is skipped, and browser-only bookmarks are adopted by URL before creating a new raindrop. This stops the create→event→duplicate-raindrop feedback loop.
+- **Teardown cancels the trigger**: `unregisterBookmarkListeners()` (called on disable, disconnect, and last-mapping-removed) clears any armed `scheduleReconcile` timer, so no pass fires after auto-sync is disabled (task 007) or writes into freshly-wiped storage after a disconnect blank-slate (task 011). `reconcileAllMappings` has **no** `enabled` gate by design — the automatic triggers gate before arming the timer, while manual Sync Now deliberately bypasses the toggle.
 
 ### State model
 
@@ -72,8 +69,8 @@ Sync writes bookmarks, which fire bookmark events, which would enqueue more sync
 Chrome kills the background service worker when idle, so:
 
 - Bookmark listeners and `initialize()` are registered at the **top level** of `index.ts` (module load), not inside an async callback — otherwise they're lost on SW restart.
-- Periodic work is driven by **alarms** (`process-queue` every 1 min, `raindrop-sync-interval` for pull), never `setInterval`. Alarm/message listeners **return the Promise** so the SW stays alive until async work finishes.
-- The queue uses a stale-tolerant lock in `storage.local` (`PROCESSING_LOCK_KEY`, 5-min timeout) because an in-memory lock wouldn't survive a SW restart.
+- Periodic work is driven by the **`raindrop-sync-interval` alarm**, never `setInterval`. Alarm/message listeners **return the Promise** so the SW stays alive until async work finishes. The real-time debounce is a one-shot `setTimeout`; if the SW dies before it fires, the periodic alarm reconcile catches up (so a missed trigger loses latency, never the change).
+- `reconcileAllMappings` uses a stale-tolerant lock in `storage.local` (`reconcile_lock`, 5-min timeout) because an in-memory lock wouldn't survive a SW restart.
 - Alarm creation checks for an existing alarm first, to avoid resetting the timer on every SW wake-up.
 
 ## Conventions

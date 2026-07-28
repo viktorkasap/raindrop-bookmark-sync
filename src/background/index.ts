@@ -2,22 +2,21 @@
 
 import browser from 'webextension-polyfill';
 import { logger } from '../utils/logger';
-import { getSettings, isAuthenticated, getApiToken, saveApiToken, clearApiToken } from './storage';
+import { getSettings, isAuthenticated, getApiToken, saveApiToken, clearApiToken, resetLocalState } from './storage';
 import {
   registerBookmarkListeners,
   unregisterBookmarkListeners,
 } from './bookmarkListeners';
-import { queueProcessor } from './queue';
 import {
   setupPeriodicSync,
   handleSyncAlarm,
-  pullFromRaindrop,
-  pushToRaindrop,
+  reconcileAllMappings,
   performInitialSync,
   performFullResync,
   getSyncStatus,
   syncFolderWithChildren,
   clearCachedUser,
+  propagateBrowserFolderDeletions,
 } from './syncManager';
 import {
   logout,
@@ -38,8 +37,13 @@ async function initialize(): Promise<void> {
     const settings = await getSettings();
     logger.setDebugMode(settings.debugMode);
 
+    // No mapping, no sync (task 012): normalize a stale enabled=true left over
+    // with zero mappings (e.g. from before this rule) so it can't silently
+    // resume when a mapping is next added.
+    const { disableAutoSyncIfNoMappings } = await import('./storage');
+    await disableAutoSyncIfNoMappings();
+
     // Always start sync services (they check internally for auth/enabled)
-    await queueProcessor.start();
     await setupPeriodicSync();
 
     logger.info('Sync services started');
@@ -59,11 +63,15 @@ async function handleMessage(
     switch (request.action) {
       // ==================== Auth ====================
       case 'logout':
+        // Disconnect = full teardown. Stop all background activity FIRST so
+        // nothing writes back into storage after the wipe, then blank-slate the
+        // extension's local state (task 011). Browser folders + Raindrop
+        // collections are the user's data and are left untouched.
         await logout();
         clearCachedUser();
         unregisterBookmarkListeners();
-        queueProcessor.stop();
         await browser.alarms.clearAll();
+        await resetLocalState();
         return { success: true };
 
       case 'isAuthenticated':
@@ -94,19 +102,25 @@ async function handleMessage(
         return { success: true, data: settings };
 
       case 'updateSettings':
-        const { updateSettings } = await import('./storage');
-        const newSettings = await updateSettings(
-          request.data as Record<string, unknown>
-        );
+        const { updateSettings, getFolderMappings: getMappingsForGuard } = await import('./storage');
+        let settingsUpdates = request.data as Record<string, unknown>;
+        // No mapping, no sync (task 012): never let sync be enabled with zero
+        // mappings, whatever asked (the popup has its own toggle). Authoritative
+        // guard so every path is covered, not just the options UI.
+        if (
+          settingsUpdates.enabled === true &&
+          (await getMappingsForGuard()).length === 0
+        ) {
+          settingsUpdates = { ...settingsUpdates, enabled: false };
+        }
+        const newSettings = await updateSettings(settingsUpdates);
 
         // Apply settings changes
         if (newSettings.enabled) {
           registerBookmarkListeners();
-          queueProcessor.start();
           await setupPeriodicSync();
         } else {
           unregisterBookmarkListeners();
-          queueProcessor.stop();
           await browser.alarms.clear('raindrop-sync-interval');
         }
 
@@ -141,8 +155,15 @@ async function handleMessage(
         return { success: true, data: addedMappings };
 
       case 'removeFolderMapping':
-        const { removeFolderMapping } = await import('./storage');
+        const { removeFolderMapping, disableAutoSyncIfNoMappings } = await import('./storage');
         await removeFolderMapping(request.data as string);
+        // No mappings left → nothing to sync: force auto-sync off and tear down
+        // the auto-sync services (task 012), mirroring the disable path in
+        // updateSettings so the periodic alarm/listeners don't run against nothing.
+        if (await disableAutoSyncIfNoMappings()) {
+          unregisterBookmarkListeners();
+          await browser.alarms.clear('raindrop-sync-interval');
+        }
         return { success: true };
 
       case 'syncFolderWithChildren':
@@ -162,47 +183,38 @@ async function handleMessage(
         return { success: true, data: status };
 
       case 'triggerSync':
-        // Full sync: push local changes then pull remote changes
+        // One unified three-way reconcile (task 014): deletion propagation,
+        // tree reconciliation, per-object direction and union of never-synced
+        // mappings all happen inside reconcileAllMappings.
         logger.info('Manual sync triggered');
-        
-        try {
-          // First, process any pending operations in the queue
-          await queueProcessor.processQueue();
 
-          // Then ensure all existing bookmarks in mapped folders are synced
-          const { getFolderMappings, getBookmarkLinksForMapping } = await import('./storage');
-          const mappingsForSync = await getFolderMappings();
-          
-          for (const mapping of mappingsForSync) {
-            // Check if this mapping has any links - if not, perform initial sync
-            const existingLinks = await getBookmarkLinksForMapping(mapping.id);
-            
-            if (existingLinks.length === 0) {
-              logger.info(`No links found for mapping ${mapping.folderName}, performing initial sync`);
-              await performInitialSync(mapping);
-            }
-          }
-          
-          // Then do push/pull for everything else
-          const pushResult = await pushToRaindrop();
-          const pullResult = await pullFromRaindrop();
-          
-          // Wait a moment for storage to settle
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
+        try {
+          const r = await reconcileAllMappings();
+
           // Get updated stats and status
           const { getSyncStats } = await import('./storage');
           const updatedStats = await getSyncStats();
           const updatedStatus = await getSyncStatus();
-          
+
           return {
             success: true,
             data: {
-              push: pushResult,
-              pull: pullResult,
+              // UI-compatible shape (popup/options read push/pull counts)
+              push: {
+                created: r.createdInRaindrop,
+                updated: r.pushed,
+                deleted: r.deletedInRaindrop,
+                errors: r.errors,
+              },
+              pull: {
+                created: r.createdInBrowser + r.adopted,
+                updated: r.pulled,
+                deleted: r.deletedInBrowser,
+                errors: [],
+              },
               stats: updatedStats,
-              status: updatedStatus
-            }
+              status: updatedStatus,
+            },
           };
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -235,27 +247,10 @@ async function handleMessage(
         const stats = await getSyncStats();
         return { success: true, data: stats };
 
-      case 'clearSyncErrors':
-        const { clearSyncErrors } = await import('./storage');
-        await clearSyncErrors();
-        return { success: true };
-
-      // ==================== Queue ====================
-      case 'getQueue':
-        const { getQueue } = await import('./storage');
-        const queue = await getQueue();
-        return { success: true, data: queue };
-
-      case 'retryFailed':
-        const { retryFailed } = await import('./storage');
-        await retryFailed();
-        queueProcessor.forceProcess();
-        return { success: true };
-
-      case 'clearQueue':
-        const { clearQueue } = await import('./storage');
-        await clearQueue();
-        return { success: true };
+      case 'getSyncErrors':
+        const { getSyncErrors } = await import('./storage');
+        const syncErrors = await getSyncErrors();
+        return { success: true, data: syncErrors };
 
       // ==================== Debug ====================
       case 'exportData':
@@ -286,16 +281,10 @@ browser.runtime.onMessage.addListener((request: any) => {
   return handleMessage(request);
 });
 
-// Alarm listener for periodic sync and queue processing.
+// Alarm listener for the periodic reconcile.
 // MUST return a Promise so Chrome MV3 keeps the Service Worker alive
 // until the async work completes.
-browser.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'process-queue') {
-    return queueProcessor.processQueue();
-  } else {
-    return handleSyncAlarm(alarm);
-  }
-});
+browser.alarms.onAlarm.addListener((alarm) => handleSyncAlarm(alarm));
 
 // Installation/update listener
 browser.runtime.onInstalled.addListener((details) => {
@@ -305,6 +294,9 @@ browser.runtime.onInstalled.addListener((details) => {
     browser.runtime.openOptionsPage();
   } else if (details.reason === 'update') {
     logger.info(`Extension updated to version ${browser.runtime.getManifest().version}`);
+    // Migration: the operation queue was removed in 014. Clear its leftover
+    // 1-minute alarm so an upgraded install stops firing a now-ignored event.
+    void browser.alarms.clear('process-queue');
   }
 });
 

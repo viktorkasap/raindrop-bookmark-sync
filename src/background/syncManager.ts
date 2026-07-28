@@ -1,14 +1,15 @@
 // Sync Manager - Core synchronization logic
 
-import { FolderMapping, BookmarkLink, SyncOperation } from '../types/storage';
+import { FolderMapping, BookmarkLink, SyncErrorEntry, SyncErrorType } from '../types/storage';
 import { SyncStatus } from '../types/messages';
-import { Raindrop, Collection, CreateRaindropData } from '../types/raindrop';
+import { Raindrop, Collection } from '../types/raindrop';
 import {
   getSettings,
   updateSettings,
   getFolderMappings,
   addFolderMapping,
   updateFolderMapping,
+  removeFolderMapping,
   getBookmarkLinks,
   saveBookmarkLinks,
   addBookmarkLink,
@@ -16,7 +17,7 @@ import {
   removeBookmarkLink,
   updateSyncStats,
   getSyncStats,
-  getBookmarkLinksForMapping,
+  setSyncErrors,
   isAuthenticated as checkIsAuthenticated,
 } from './storage';
 import {
@@ -24,6 +25,11 @@ import {
   getAllRaindropsInCollection,
   createRaindrops,
   createCollection,
+  updateCollection,
+  updateRaindrop,
+  deleteRaindrop,
+  deleteCollection,
+  getCollection,
   getCurrentUser,
 } from './raindropApi';
 import { setSyncing } from './bookmarkListeners';
@@ -37,6 +43,14 @@ import {
   urlsMatch,
   isValidSyncUrl,
 } from '../utils/hash';
+import { isBookmarkNode, isFolderNode } from '../utils/bookmarkNode';
+import {
+  namesMatch,
+  decideBookmarkAction,
+  decideRenameAction,
+  type BookmarkSnapshot,
+} from './reconcile';
+import { getChildCollectionsOf } from '../utils/collections';
 
 // ==================== Initial Sync ====================
 
@@ -44,678 +58,911 @@ export interface InitialSyncResult {
   matched: number;
   createdInRaindrop: number;
   createdInFirefox: number;
+  foldersSynced: number;
   errors: string[];
 }
 
+// Since task 014 this is a thin wrapper over the unified three-way reconcile:
+// build/refresh the folder↔collection subtree, then run one global reconcile
+// pass. With no baseline (fresh mapping) the engine unions both sides by
+// construction — same semantics the old initialSyncForMapping implemented by
+// hand, minus its duplicate-creation races (task 013).
 export async function performInitialSync(
   mapping: FolderMapping
 ): Promise<InitialSyncResult> {
-  const result: InitialSyncResult = {
-    matched: 0,
-    createdInRaindrop: 0,
-    createdInFirefox: 0,
-    errors: [],
-  };
+  logger.info(`Starting initial sync for folder: ${mapping.folderName}`);
 
+  // The subtree walk repeats inside reconcileAllMappings — accepted double
+  // work on this rare path; the wrapper needs the subtree for foldersSynced.
+  // One setSyncing envelope over both (the depth counter nests) so no
+  // bookmark event slips through between the tree walk and the engine pass.
+  const collectionsCache = await getAllCollections();
   setSyncing(true);
-
+  let subtree: FolderMapping[];
+  let r: ReconcileResult;
   try {
-    logger.info(`Starting initial sync for folder: ${mapping.folderName}`);
-
-    // Verify folder still exists
-    try {
-      await browser.bookmarks.get(mapping.firefoxFolderId);
-    } catch (error) {
-      logger.error(`Folder ${mapping.folderName} (${mapping.firefoxFolderId}) no longer exists`);
-      result.errors.push(`Folder "${mapping.folderName}" not found`);
-      return result;
-    }
-
-    // Get all Firefox bookmarks in the folder
-    const firefoxBookmarks = await browser.bookmarks.getChildren(
-      mapping.firefoxFolderId
-    );
-    const bookmarks = firefoxBookmarks.filter(
-      (b) => (b.type === 'bookmark' || (!b.type && b.url)) && b.url
-    );
-
-    // Get all raindrops from the collection
-    const raindrops = await getAllRaindropsInCollection(
-      mapping.raindropCollectionId
-    );
-
-    // Match bookmarks by URL
-    const matched: { bookmark: Bookmarks.BookmarkTreeNode; raindrop: Raindrop }[] = [];
-    const onlyInFirefox: Bookmarks.BookmarkTreeNode[] = [];
-    const onlyInRaindrop: Raindrop[] = [];
-
-    // Create URL map for faster lookup
-    const raindropByUrl = new Map<string, Raindrop>();
-    for (const raindrop of raindrops) {
-      raindropByUrl.set(normalizeUrl(raindrop.link), raindrop);
-    }
-
-    // Match Firefox bookmarks to Raindrops
-    for (const bookmark of bookmarks) {
-      if (!bookmark.url) continue;
-
-      // Skip internal browser URLs
-      if (!isValidSyncUrl(bookmark.url)) continue;
-
-      const normalizedUrl = normalizeUrl(bookmark.url);
-      const matchingRaindrop = raindropByUrl.get(normalizedUrl);
-
-      if (matchingRaindrop) {
-        matched.push({ bookmark, raindrop: matchingRaindrop });
-        raindropByUrl.delete(normalizedUrl); // Remove from map to track unmatched
-      } else {
-        onlyInFirefox.push(bookmark);
-      }
-    }
-
-    // Remaining raindrops are only in Raindrop
-    onlyInRaindrop.push(...raindropByUrl.values());
-
-    // Create bookmark links for matched items
-    for (const { bookmark, raindrop } of matched) {
-      const link: BookmarkLink = {
-        id: generateId(),
-        firefoxId: bookmark.id,
-        raindropId: raindrop._id,
-        url: bookmark.url!,
-        title: bookmark.title,
-        lastModified: Date.now(),
-        contentHash: computeBookmarkHash(bookmark.url!, bookmark.title),
-        syncStatus: 'synced',
-        mappingId: mapping.id,
-      };
-
-      await addBookmarkLink(link);
-      result.matched++;
-    }
-
-    // Create raindrops for Firefox-only bookmarks
-    if (onlyInFirefox.length > 0) {
-      try {
-        logger.info(`Bulk creating ${onlyInFirefox.length} raindrops for initial sync`);
-        const raindropsToCreate = onlyInFirefox
-          .filter(b => b.url)
-          .map(b => ({
-            link: b.url!,
-            title: b.title,
-            collection: { $id: mapping.raindropCollectionId },
-          }));
-        
-        const createdRaindrops = await createRaindrops(raindropsToCreate);
-        
-        // Match created raindrops back to Firefox bookmarks by URL.
-        // Use splice to avoid matching the same bookmark twice when URLs are identical.
-        const remainingBookmarks = [...onlyInFirefox];
-        for (const raindrop of createdRaindrops) {
-          const idx = remainingBookmarks.findIndex(b => b.url && urlsMatch(b.url, raindrop.link));
-          if (idx === -1) continue;
-
-          const originalBookmark = remainingBookmarks[idx];
-          remainingBookmarks.splice(idx, 1);
-
-          const link: BookmarkLink = {
-            id: generateId(),
-            firefoxId: originalBookmark.id,
-            raindropId: raindrop._id,
-            url: raindrop.link,
-            title: raindrop.title,
-            lastModified: Date.now(),
-            contentHash: computeBookmarkHash(raindrop.link, raindrop.title),
-            syncStatus: 'synced',
-            mappingId: mapping.id,
-          };
-
-          await addBookmarkLink(link);
-          result.createdInRaindrop++;
-        }
-      } catch (error) {
-        const errorMsg = `Initial bulk create in Raindrop failed: ${error}`;
-        result.errors.push(errorMsg);
-        logger.error(errorMsg);
-      }
-    }
-
-    // Create Firefox bookmarks for Raindrop-only items
-    for (const raindrop of onlyInRaindrop) {
-      try {
-        const bookmark = await browser.bookmarks.create({
-          parentId: mapping.firefoxFolderId,
-          title: raindrop.title,
-          url: raindrop.link,
-        });
-
-        const link: BookmarkLink = {
-          id: generateId(),
-          firefoxId: bookmark.id,
-          raindropId: raindrop._id,
-          url: raindrop.link,
-          title: raindrop.title,
-          lastModified: Date.now(),
-          contentHash: computeRaindropHash(raindrop.link, raindrop.title),
-          syncStatus: 'synced',
-          mappingId: mapping.id,
-        };
-
-        await addBookmarkLink(link);
-        result.createdInFirefox++;
-      } catch (error) {
-        const errorMsg = `Failed to create bookmark for "${raindrop.title}": ${error}`;
-        result.errors.push(errorMsg);
-        logger.error(errorMsg);
-      }
-    }
-
-    // Update mapping with last sync time
-    await updateFolderMapping(mapping.id, { lastSync: Date.now() });
-
-    logger.info('Initial sync completed', result);
-
-    return result;
+    subtree = await reconcileFolderTree(mapping, collectionsCache);
+    r = await reconcileAllMappings();
   } finally {
     setSyncing(false);
   }
+  const result: InitialSyncResult = {
+    matched: r.adopted,
+    createdInRaindrop: r.createdInRaindrop,
+    createdInFirefox: r.createdInBrowser,
+    foldersSynced: subtree.length,
+    errors: r.errors,
+  };
+  logger.info('Initial sync completed', result);
+  return result;
 }
 
-// ==================== Pull Sync (Raindrop → Firefox) ====================
+// ==================== Deletion Propagation (task 010) ====================
 
-export interface PullSyncResult {
-  created: number;
-  updated: number;
-  deleted: number;
+// Distinguish a genuine "bookmark does not exist" rejection from a transient
+// error, so deletion catch-up can fail closed (task 006). Messages differ per
+// browser: Firefox "Bookmark not found"; Chrome "Can't find bookmark for id.".
+// A Raindrop API error carrying HTTP 404 — the collection genuinely does not
+// exist (deleted). apiRequest attaches `.status` to the thrown error. Used to
+// confirm a deletion before acting, so an incomplete collections list or a
+// transient/network error never triggers a destructive folder removal.
+function isCollectionNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { status?: number }).status === 404
+  );
+}
+
+function isBookmarkNotFoundError(error: unknown): boolean {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  // Must be specifically about a bookmark — guarding a destructive delete, so
+  // a generic "... not found" (e.g. "Bookmarks database not found") must miss.
+  return (
+    /\bbookmark not found\b/.test(msg) || // Firefox
+    /can'?t find bookmark/.test(msg) || // Chrome: "Can't find bookmark for id."
+    /cannot find bookmark/.test(msg) ||
+    /no bookmark (?:with )?id/.test(msg)
+  );
+}
+
+/**
+ * Propagate browser folder deletions to Raindrop (task 010, direction A).
+ *
+ * Bidirectional-delete model (iCloud/GDrive): a mapped browser folder that was
+ * deleted must delete its Raindrop collection too, then drop the mapping.
+ * `deleteCollection` cascades server-side — child collections are removed and
+ * their raindrops go to Trash (verified against the API), so one call handles a
+ * whole subtree. Running BEFORE reconcile (and re-fetching the collections
+ * cache after) means the deleted collection is gone from the cache, so reconcile
+ * never resurrects the folder.
+ *
+ * Fail-closed like the per-bookmark deletion catch-up: only a *confirmed*
+ * "bookmark not found" triggers deletion. A transient error (network, etc.) is
+ * treated as "folder still there" so a flaky read never destroys data.
+ *
+ * Supersedes task 008's prune, which kept the collection (that produced the
+ * "deleted nested folder keeps coming back" bug — reconcile re-created it from
+ * the surviving collection).
+ *
+ * Returns the ids of the removed mappings.
+ */
+export async function propagateBrowserFolderDeletions(): Promise<string[]> {
+  const mappings = await getFolderMappings();
+  const removedIds: string[] = [];
+
+  for (const mapping of mappings) {
+    try {
+      // Fail-closed: act ONLY on a confirmed "bookmark not found". If get
+      // resolves (with anything) the folder exists — keep. A transient error
+      // (network, etc.) must never destroy data, so we swallow only the
+      // specific not-found rejection and treat everything else as "keep".
+      await browser.bookmarks.get(mapping.firefoxFolderId);
+      continue; // folder exists → keep
+    } catch (error) {
+      if (!isBookmarkNotFoundError(error)) {
+        logger.warn(
+          `Skipping "${mapping.folderName}" — folder check failed with a non-not-found error`,
+          error
+        );
+        continue;
+      }
+    }
+
+    // Confirmed: the folder no longer exists in the browser → propagate delete.
+    logger.info(
+      `Folder for mapping "${mapping.folderName}" (${mapping.firefoxFolderId}) was deleted in the browser — deleting Raindrop collection ${mapping.raindropCollectionId} (cascades children; raindrops → Trash) and dropping the mapping`
+    );
+
+    let collectionGone = false;
+    try {
+      await deleteCollection(mapping.raindropCollectionId);
+      collectionGone = true;
+    } catch (error) {
+      if (isCollectionNotFoundError(error)) {
+        // Already gone (cascaded by an ancestor deleted earlier this pass).
+        collectionGone = true;
+      } else {
+        // Transient/network failure — do NOT drop the mapping, or the
+        // collection would be orphaned in Raindrop with no retry path. Keep it
+        // and retry on the next sync. The mapping meanwhile points at a folder
+        // that no longer exists; reconcile skips such a mapping (it does not
+        // resurrect), so no duplicate is created before the retry succeeds.
+        logger.warn(
+          `deleteCollection(${mapping.raindropCollectionId}) failed transiently for "${mapping.folderName}" — keeping mapping to retry`,
+          error
+        );
+      }
+    }
+    if (!collectionGone) continue;
+
+    try {
+      // Cascades to child mappings + drops all associated bookmark links.
+      await removeFolderMapping(mapping.id);
+      removedIds.push(mapping.id);
+    } catch (error) {
+      // One removal failing must not abort the whole sync.
+      logger.error(`Failed to drop mapping "${mapping.folderName}"`, error);
+    }
+  }
+
+  return removedIds;
+}
+
+/**
+ * Propagate Raindrop collection deletions to the browser (task 010, direction B).
+ *
+ * The other half of bidirectional delete: a collection deleted on the server
+ * removes the mapped browser folder (removeTree cascades child folders) and
+ * drops the mapping (+ child mappings + links). Takes the already-fetched
+ * collections cache so it shares one API read with the caller and can trust it.
+ *
+ * Fail-closed (data-loss guard): an EMPTY cache is never acted on. A folder
+ * moved elsewhere keeps the same collection id, so only a truly absent id counts
+ * as deleted. Must run inside setSyncing() — removeTree fires onRemoved events.
+ *
+ * Returns the ids of the removed mappings.
+ */
+export async function propagateRaindropCollectionDeletions(
+  collectionsCache: Collection[]
+): Promise<string[]> {
+  const removedIds: string[] = [];
+
+  // Too dangerous to act on an empty list — a transient wipe would mass-delete
+  // every synced folder. getAllCollections throws on fetch failure, but the
+  // blast radius of a false "empty" isn't worth it.
+  if (collectionsCache.length === 0) {
+    logger.warn(
+      'Skipping Raindrop-side deletion propagation — empty collections cache'
+    );
+    return removedIds;
+  }
+
+  const liveIds = new Set(collectionsCache.map((c) => c._id));
+  const mappings = await getFolderMappings();
+
+  for (const mapping of mappings) {
+    if (liveIds.has(mapping.raindropCollectionId)) continue; // collection alive
+
+    // Absent from the cache is NOT proof of deletion — the list could be
+    // incomplete (deep nesting, an API quirk). Before destroying a browser
+    // folder, CONFIRM the collection is really gone with a direct fetch: a
+    // successful fetch means the cache was incomplete → keep; only a 404
+    // (confirmed deleted) proceeds; a transient error keeps it (fail-closed).
+    try {
+      await getCollection(mapping.raindropCollectionId);
+      continue; // collection actually exists → cache was incomplete → keep
+    } catch (error) {
+      if (!isCollectionNotFoundError(error)) {
+        logger.warn(
+          `Keeping "${mapping.folderName}" — collection ${mapping.raindropCollectionId} existence check failed (non-404), not treating as deleted`,
+          error
+        );
+        continue;
+      }
+    }
+
+    logger.info(
+      `Collection ${mapping.raindropCollectionId} ("${mapping.raindropCollectionName}") was deleted in Raindrop — removing browser folder ${mapping.firefoxFolderId} and dropping the mapping`
+    );
+    try {
+      // Cascades to child folders in the browser.
+      await browser.bookmarks.removeTree(mapping.firefoxFolderId);
+    } catch (error) {
+      // Folder may already be gone (cascaded with a parent removed earlier this
+      // pass, or deleted by the user) — tolerate and still drop the mapping.
+      logger.warn(
+        `removeTree(${mapping.firefoxFolderId}) failed (may already be gone) for "${mapping.folderName}"`,
+        error
+      );
+    }
+    try {
+      await removeFolderMapping(mapping.id);
+      removedIds.push(mapping.id);
+    } catch (error) {
+      logger.error(`Failed to drop mapping "${mapping.folderName}"`, error);
+    }
+  }
+
+  return removedIds;
+}
+
+// ==================== Unified Three-Way Reconcile (task 014) ====================
+
+// Stale-tolerant storage lock: only one reconcile at a time, surviving MV3 SW
+// restarts (same pattern the old queue used).
+const RECONCILE_LOCK_KEY = 'reconcile_lock';
+const RECONCILE_LOCK_TIMEOUT = 5 * 60 * 1000;
+
+async function acquireReconcileLock(): Promise<boolean> {
+  const result = await browser.storage.local.get(RECONCILE_LOCK_KEY);
+  const lock = result[RECONCILE_LOCK_KEY] as { timestamp: number } | undefined;
+  if (lock && Date.now() - lock.timestamp < RECONCILE_LOCK_TIMEOUT) return false;
+  await browser.storage.local.set({
+    [RECONCILE_LOCK_KEY]: { timestamp: Date.now() },
+  });
+  return true;
+}
+
+async function releaseReconcileLock(): Promise<void> {
+  await browser.storage.local.remove(RECONCILE_LOCK_KEY);
+}
+
+// One shape for every link the reconcile creates — keeps the BookmarkLink
+// schema in a single place across the adopt/create paths.
+function buildLink(
+  firefoxId: string,
+  raindropId: number,
+  url: string,
+  title: string,
+  contentHash: string,
+  mappingId: string
+): BookmarkLink {
+  return {
+    id: generateId(),
+    firefoxId,
+    raindropId,
+    url,
+    title,
+    lastModified: Date.now(),
+    contentHash,
+    syncStatus: 'synced',
+    mappingId,
+  };
+}
+
+export interface ReconcileResult {
+  pushed: number; // browser→Raindrop updates/moves of linked bookmarks
+  pulled: number; // Raindrop→browser updates/moves/resurrections
+  createdInRaindrop: number; // no-baseline browser-only bookmarks
+  createdInBrowser: number; // no-baseline raindrop-only bookmarks
+  adopted: number; // URL-matched pairs linked without creating anything
+  deletedInRaindrop: number;
+  deletedInBrowser: number;
   errors: string[];
 }
 
-export async function pullFromRaindrop(): Promise<PullSyncResult> {
-  const result: PullSyncResult = {
-    created: 0,
-    updated: 0,
-    deleted: 0,
+// NOTE: no `settings.enabled` guard here — the toggle gates only the
+// AUTOMATIC triggers (periodic alarm in handleSyncAlarm, event-driven path).
+// Manual "Sync Now" / "Full Resync" call this directly and must run
+// regardless (task 007).
+export async function reconcileAllMappings(): Promise<ReconcileResult> {
+  const result: ReconcileResult = {
+    pushed: 0,
+    pulled: 0,
+    createdInRaindrop: 0,
+    createdInBrowser: 0,
+    adopted: 0,
+    deletedInRaindrop: 0,
+    deletedInBrowser: 0,
     errors: [],
   };
 
-  const settings = await getSettings();
-  if (!settings.enabled) {
-    logger.debug('Sync is disabled');
+  if (!(await acquireReconcileLock())) {
+    logger.debug('Reconcile already in progress (lock held), skipping');
     return result;
   }
 
-  // Check if sync is already in progress
-  const { isSyncInProgress } = await import('./bookmarkListeners');
-  if (isSyncInProgress()) {
-    logger.debug('Sync already in progress, skipping pull');
-    return result;
-  }
-
-  const mappings = await getFolderMappings();
-  if (mappings.length === 0) {
-    logger.debug('No folder mappings configured');
-    return result;
-  }
+  // Structured errors for the UI (task 015): same messages as result.errors,
+  // plus a short `type` (which operation failed) so the Options panel can show
+  // "type — message". Persisted (replace-all) at pass end, so a clean pass
+  // clears them and a re-run reflects only the current state.
+  const errorEntries: SyncErrorEntry[] = [];
+  const recordError = (type: SyncErrorType, message: string): void => {
+    result.errors.push(message);
+    errorEntries.push({ type, message });
+  };
 
   setSyncing(true);
-
   try {
-    logger.info('Starting pull sync from Raindrop');
+    // Structural passes first — identical order to the old push/pull preamble.
+    await propagateBrowserFolderDeletions();
+    if ((await getFolderMappings()).length === 0) {
+      await setSyncErrors([]);
+      return result;
+    }
 
-    for (const mapping of mappings) {
+    const collectionsCache = await getAllCollections();
+    await propagateRaindropCollectionDeletions(collectionsCache);
+
+    for (const root of (await getFolderMappings()).filter((m) => m.depth === 0)) {
       try {
-        const mappingResult = await pullSyncForMapping(mapping);
-        result.created += mappingResult.created;
-        result.updated += mappingResult.updated;
-        result.deleted += mappingResult.deleted;
-        result.errors.push(...mappingResult.errors);
+        await reconcileFolderTree(root, collectionsCache);
       } catch (error) {
-        const errorMsg = `Failed to sync mapping ${mapping.folderName}: ${error}`;
-        result.errors.push(errorMsg);
-        logger.error(errorMsg);
+        const msg = `Failed to reconcile folder tree for ${root.folderName}: ${error}`;
+        recordError('folder', msg);
+        logger.error(msg);
       }
     }
 
-    // Update stats
-    await updateSyncStats({
-      lastSyncTime: Date.now(),
-      lastSyncStatus: result.errors.length === 0 ? 'success' : 'partial',
-    });
+    const allMappings = await getFolderMappings();
+    const mappingById = new Map(allMappings.map((m) => [m.id, m]));
+    const existingCollectionIds = new Set(collectionsCache.map((c) => c._id));
 
-    logger.info('Pull sync completed', result);
+    // ---- Snapshot both sides globally (cross-mapping move detection) ----
+    // A mapping whose side could not be read is UNAVAILABLE: its links are
+    // skipped entirely, so a failed read never looks like "everything deleted"
+    // (deletion-safety guard, parity with task 001).
+    const unavailable = new Set<string>();
 
-    return result;
-  } finally {
-    setSyncing(false);
-  }
-}
-
-async function pullSyncForMapping(
-  mapping: FolderMapping
-): Promise<PullSyncResult> {
-  const result: PullSyncResult = {
-    created: 0,
-    updated: 0,
-    deleted: 0,
-    errors: [],
-  };
-
-  // Get all raindrops from collection
-  const raindrops = await getAllRaindropsInCollection(
-    mapping.raindropCollectionId
-  );
-
-  // Get local bookmark links for this mapping only
-  const localLinks = await getBookmarkLinksForMapping(mapping.id);
-
-  // Get ALL local bookmark links for global deduplication
-  const allLinks = await getBookmarkLinks();
-
-  // Global map — for checking if raindrop is already linked in ANY mapping
-  const globalLinksByRaindropId = new Map<number, BookmarkLink>();
-  for (const link of allLinks) {
-    globalLinksByRaindropId.set(link.raindropId, link);
-  }
-
-  // Local map — only links belonging to THIS mapping (safe to update)
-  const localLinksByRaindropId = new Map<number, BookmarkLink>();
-  for (const link of localLinks) {
-    localLinksByRaindropId.set(link.raindropId, link);
-  }
-
-  const raindropById = new Map<number, Raindrop>();
-  for (const raindrop of raindrops) {
-    raindropById.set(raindrop._id, raindrop);
-  }
-
-  // URL set — for detecting duplicate raindrops (same URL, different ID).
-  // Prevents exponential duplication when a raindrop is duplicated in Raindrop.io.
-  const linkedUrls = new Set<string>();
-  for (const link of allLinks) {
-    if (link.url) {
-      linkedUrls.add(normalizeUrl(link.url));
+    const raindropsByMapping = new Map<string, Raindrop[]>();
+    const raindropLoc = new Map<number, { raindrop: Raindrop; mappingId: string }>();
+    for (const m of allMappings) {
+      if (!existingCollectionIds.has(m.raindropCollectionId)) {
+        logger.warn(
+          `Collection ${m.raindropCollectionId} ("${m.raindropCollectionName}") not in cache, skipping mapping ${m.folderName}`
+        );
+        unavailable.add(m.id);
+        continue;
+      }
+      try {
+        const drops = await getAllRaindropsInCollection(m.raindropCollectionId);
+        raindropsByMapping.set(m.id, drops);
+        for (const r of drops) raindropLoc.set(r._id, { raindrop: r, mappingId: m.id });
+      } catch (error) {
+        unavailable.add(m.id);
+        recordError('fetch', `Failed to fetch raindrops for ${m.folderName}: ${error}`);
+      }
     }
-  }
 
-  // Process raindrops
-  for (const raindrop of raindrops) {
-    const globalLink = globalLinksByRaindropId.get(raindrop._id);
-    const localLink = localLinksByRaindropId.get(raindrop._id);
+    const browserByMapping = new Map<string, Bookmarks.BookmarkTreeNode[]>();
+    const browserLoc = new Map<
+      string,
+      { node: Bookmarks.BookmarkTreeNode; mappingId: string }
+    >();
+    for (const m of allMappings) {
+      try {
+        const children = (
+          await browser.bookmarks.getChildren(m.firefoxFolderId)
+        ).filter(isBookmarkNode);
+        browserByMapping.set(m.id, children);
+        for (const b of children) browserLoc.set(b.id, { node: b, mappingId: m.id });
+      } catch (error) {
+        unavailable.add(m.id);
+        logger.warn(`Failed to read browser folder for ${m.folderName}, skipping mapping`, error);
+      }
+    }
 
-    if (!globalLink) {
-      // Check if this URL is already linked via another raindrop ID (duplicate raindrop).
-      // This stops the feedback loop: pull creates bookmark → event queues create →
-      // queue creates duplicate raindrop with new ID → next pull sees it as "new" → repeat.
-      const normalizedUrl = normalizeUrl(raindrop.link);
-      if (linkedUrls.has(normalizedUrl)) {
-        logger.debug(`Raindrop ${raindrop._id} URL already linked, skipping duplicate`);
+    // ---- Phase 1: linked bookmarks (baseline exists) — three-way per link ----
+    const allLinks = await getBookmarkLinks();
+    for (const link of allLinks) {
+      if (!mappingById.has(link.mappingId) || unavailable.has(link.mappingId)) continue;
+      const bLoc = browserLoc.get(link.firefoxId);
+      const rLoc = raindropLoc.get(link.raindropId);
+      // A side that resolved into an unavailable mapping can't be judged — skip.
+      if (
+        (bLoc && unavailable.has(bLoc.mappingId)) ||
+        (rLoc && unavailable.has(rLoc.mappingId))
+      ) {
         continue;
       }
 
-      // Truly new raindrop — not linked in any mapping. Create Firefox bookmark.
-      try {
-        const bookmark = await browser.bookmarks.create({
-          parentId: mapping.firefoxFolderId,
-          title: raindrop.title,
-          url: raindrop.link,
-        });
-
-        const link: BookmarkLink = {
-          id: generateId(),
-          firefoxId: bookmark.id,
-          raindropId: raindrop._id,
-          url: raindrop.link,
-          title: raindrop.title,
-          lastModified: Date.now(),
-          contentHash: computeRaindropHash(raindrop.link, raindrop.title),
-          syncStatus: 'synced',
-          mappingId: mapping.id,
-        };
-
-        await addBookmarkLink(link);
-        linkedUrls.add(normalizedUrl);
-        result.created++;
-      } catch (error) {
-        result.errors.push(`Failed to create bookmark: ${error}`);
-      }
-    } else if (localLink) {
-      // Link belongs to THIS mapping — safe to check for updates
-      const currentHash = computeRaindropHash(raindrop.link, raindrop.title);
-
-      if (currentHash !== localLink.contentHash) {
+      if (!bLoc) {
+        // Not under any mapped folder. Deleted, or moved out of synced scope
+        // (both mean "absent"), or an unreadable state — verify fail-closed.
         try {
-          await browser.bookmarks.update(localLink.firefoxId, {
-            title: raindrop.title,
-            url: raindrop.link,
-          });
-
-          await updateBookmarkLink(localLink.id, {
-            url: raindrop.link,
-            title: raindrop.title,
-            lastModified: Date.now(),
-            contentHash: currentHash,
-            syncStatus: 'synced',
-          });
-
-          result.updated++;
+          await browser.bookmarks.get(link.firefoxId); // alive → departed scope → absent
         } catch (error) {
-          result.errors.push(`Failed to update bookmark: ${error}`);
+          if (!isBookmarkNotFoundError(error)) continue; // can't verify → retry next pass
         }
       }
-    }
-    // If globalLink exists but localLink doesn't — raindrop is managed by another mapping, skip
-  }
 
-  // Find deleted raindrops (exist locally but not in Raindrop)
-  for (const link of localLinks) {
-    if (!raindropById.has(link.raindropId)) {
-      // Raindrop was deleted - delete Firefox bookmark
+      const base: BookmarkSnapshot = { hash: link.contentHash, mappingId: link.mappingId };
+      const browserSnap =
+        bLoc && bLoc.node.url
+          ? {
+              hash: computeBookmarkHash(bLoc.node.url, bLoc.node.title),
+              mappingId: bLoc.mappingId,
+            }
+          : null;
+      const raindropSnap = rLoc
+        ? {
+            hash: computeRaindropHash(rLoc.raindrop.link, rLoc.raindrop.title),
+            mappingId: rLoc.mappingId,
+          }
+        : null;
+
       try {
-        await browser.bookmarks.remove(link.firefoxId);
-        await removeBookmarkLink(link.id);
-        result.deleted++;
+        switch (decideBookmarkAction(base, browserSnap, raindropSnap)) {
+          case 'none':
+            break;
+          case 'push-update': {
+            const target = mappingById.get(bLoc!.mappingId)!;
+            const updates: Record<string, unknown> = {
+              link: bLoc!.node.url,
+              title: bLoc!.node.title,
+            };
+            if (bLoc!.mappingId !== link.mappingId) {
+              updates.collection = { $id: target.raindropCollectionId }; // move preserves _id
+            }
+            await updateRaindrop(link.raindropId, updates);
+            await updateBookmarkLink(link.id, {
+              url: bLoc!.node.url!,
+              title: bLoc!.node.title,
+              contentHash: browserSnap!.hash,
+              mappingId: bLoc!.mappingId,
+              lastModified: Date.now(),
+              syncStatus: 'synced',
+            });
+            result.pushed++;
+            break;
+          }
+          case 'pull-update': {
+            const target = mappingById.get(rLoc!.mappingId)!;
+            let firefoxId = link.firefoxId;
+            if (!bLoc) {
+              // Delete-vs-edit conflict → Raindrop wins → resurrect in browser.
+              const created = await browser.bookmarks.create({
+                parentId: target.firefoxFolderId,
+                title: rLoc!.raindrop.title,
+                url: rLoc!.raindrop.link,
+              });
+              firefoxId = created.id;
+            } else {
+              if (browserSnap!.hash !== raindropSnap!.hash) {
+                await browser.bookmarks.update(link.firefoxId, {
+                  title: rLoc!.raindrop.title,
+                  url: rLoc!.raindrop.link,
+                });
+              }
+              if (bLoc.mappingId !== rLoc!.mappingId) {
+                await browser.bookmarks.move(link.firefoxId, {
+                  parentId: target.firefoxFolderId,
+                });
+              }
+            }
+            await updateBookmarkLink(link.id, {
+              firefoxId,
+              url: rLoc!.raindrop.link,
+              title: rLoc!.raindrop.title,
+              contentHash: raindropSnap!.hash,
+              mappingId: rLoc!.mappingId,
+              lastModified: Date.now(),
+              syncStatus: 'synced',
+            });
+            result.pulled++;
+            break;
+          }
+          case 'delete-in-raindrop':
+            await deleteRaindrop(link.raindropId); // Raindrop Trash keeps it recoverable
+            await removeBookmarkLink(link.id);
+            result.deletedInRaindrop++;
+            break;
+          case 'delete-in-browser':
+            try {
+              await browser.bookmarks.remove(link.firefoxId);
+            } catch {
+              // already gone
+            }
+            await removeBookmarkLink(link.id);
+            result.deletedInBrowser++;
+            break;
+          case 'drop-link':
+            await removeBookmarkLink(link.id);
+            break;
+        }
       } catch (error) {
-        // Bookmark may already be deleted
-        await removeBookmarkLink(link.id);
-        result.deleted++;
+        recordError('sync', `Reconcile failed for "${link.title}": ${error}`);
       }
     }
-  }
 
-  // Update mapping last sync time
-  await updateFolderMapping(mapping.id, { lastSync: Date.now() });
-
-  return result;
-}
-
-// ==================== Push Sync (Firefox → Raindrop) ====================
-
-export interface PushSyncResult {
-  created: number;
-  updated: number;
-  errors: string[];
-}
-
-export async function pushToRaindrop(): Promise<PushSyncResult> {
-  const result: PushSyncResult = {
-    created: 0,
-    updated: 0,
-    errors: [],
-  };
-
-  const settings = await getSettings();
-  if (!settings.enabled) {
-    logger.debug('Sync is disabled');
-    return result;
-  }
-
-  // Check if sync is already in progress
-  const { isSyncInProgress } = await import('./bookmarkListeners');
-  if (isSyncInProgress()) {
-    logger.debug('Sync already in progress, skipping push');
-    return result;
-  }
-
-  const mappings = await getFolderMappings();
-  logger.info(`Starting push sync to Raindrop, mappings count: ${mappings.length}`);
-  
-  if (mappings.length === 0) {
-    logger.debug('No folder mappings configured');
-    return result;
-  }
-
-  setSyncing(true);
-
-  try {
-    for (const mapping of mappings) {
-      try {
-        const mappingResult = await pushSyncForMapping(mapping);
-        result.created += mappingResult.created;
-        result.updated += mappingResult.updated;
-        result.errors.push(...mappingResult.errors);
-      } catch (error) {
-        const errorMsg = `Failed to push mapping ${mapping.folderName}: ${error}`;
-        result.errors.push(errorMsg);
-        logger.error(errorMsg);
-      }
+    // ---- Phases 2+3: no baseline → union/merge, never delete ----
+    const linksAfter = await getBookmarkLinks();
+    const linkedFirefoxIds = new Set(linksAfter.map((l) => l.firefoxId));
+    const linkedRaindropIds = new Set(linksAfter.map((l) => l.raindropId));
+    const linkedUrls = new Set(linksAfter.map((l) => normalizeUrl(l.url)));
+    // Anything that HAD a baseline entering phase 1 was fully handled there.
+    // The side snapshots are stale by now (a raindrop deleted in phase 1 is
+    // still in raindropsByMapping, a removed bookmark still in
+    // browserByMapping) — without this union a phase-1 deletion would be
+    // resurrected here as a "new" object, oscillating on every pass.
+    for (const l of allLinks) {
+      linkedFirefoxIds.add(l.firefoxId);
+      linkedRaindropIds.add(l.raindropId);
+      linkedUrls.add(normalizeUrl(l.url));
     }
 
-    logger.info('Push sync completed', result);
+    for (const m of allMappings) {
+      if (unavailable.has(m.id)) continue;
 
+      const unlinkedDropByUrl = new Map<string, Raindrop>();
+      for (const r of raindropsByMapping.get(m.id) ?? []) {
+        if (!linkedRaindropIds.has(r._id)) unlinkedDropByUrl.set(normalizeUrl(r.link), r);
+      }
+
+      // Phase 2: browser-only bookmarks → adopt by URL, else create in Raindrop.
+      const toCreate: Bookmarks.BookmarkTreeNode[] = [];
+      for (const node of browserByMapping.get(m.id) ?? []) {
+        if (!node.url || !isValidSyncUrl(node.url) || linkedFirefoxIds.has(node.id)) continue;
+        const normalized = normalizeUrl(node.url);
+        const match = unlinkedDropByUrl.get(normalized);
+        if (match) {
+          // Same URL on both sides → adopt: link them; Raindrop wins content.
+          try {
+            if (
+              computeBookmarkHash(node.url, node.title) !==
+              computeRaindropHash(match.link, match.title)
+            ) {
+              await browser.bookmarks.update(node.id, {
+                title: match.title,
+                url: match.link,
+              });
+            }
+            await addBookmarkLink(
+              buildLink(
+                node.id,
+                match._id,
+                match.link,
+                match.title,
+                computeRaindropHash(match.link, match.title),
+                m.id
+              )
+            );
+            unlinkedDropByUrl.delete(normalized);
+            linkedRaindropIds.add(match._id);
+            linkedUrls.add(normalized);
+            result.adopted++;
+          } catch (error) {
+            // One bad adoption must not abort the rest of the pass.
+            recordError('sync', `Failed to adopt "${node.title}": ${error}`);
+          }
+        } else {
+          toCreate.push(node);
+        }
+      }
+      if (toCreate.length > 0) {
+        try {
+          const created = await createRaindrops(
+            toCreate.map((b) => ({
+              link: b.url!,
+              title: b.title,
+              collection: { $id: m.raindropCollectionId },
+            }))
+          );
+          // Splice-match back by URL — never link the same bookmark twice.
+          const remaining = [...toCreate];
+          for (const createdDrop of created) {
+            const idx = remaining.findIndex(
+              (b) => b.url && urlsMatch(b.url, createdDrop.link)
+            );
+            if (idx === -1) continue;
+            const [node] = remaining.splice(idx, 1);
+            await addBookmarkLink(
+              buildLink(
+                node.id,
+                createdDrop._id,
+                createdDrop.link,
+                createdDrop.title,
+                computeBookmarkHash(createdDrop.link, createdDrop.title),
+                m.id
+              )
+            );
+            linkedUrls.add(normalizeUrl(createdDrop.link));
+            result.createdInRaindrop++;
+          }
+        } catch (error) {
+          recordError('create', `Bulk create in Raindrop failed for ${m.folderName}: ${error}`);
+        }
+      }
+
+      // Phase 3: raindrop-only → create in browser (URL-dedup loop-killer kept).
+      for (const r of unlinkedDropByUrl.values()) {
+        const normalized = normalizeUrl(r.link);
+        if (linkedUrls.has(normalized)) {
+          logger.debug(`Raindrop ${r._id} URL already linked, skipping duplicate`);
+          continue;
+        }
+        try {
+          const created = await browser.bookmarks.create({
+            parentId: m.firefoxFolderId,
+            title: r.title,
+            url: r.link,
+          });
+          await addBookmarkLink(
+            buildLink(
+              created.id,
+              r._id,
+              r.link,
+              r.title,
+              computeRaindropHash(r.link, r.title),
+              m.id
+            )
+          );
+          linkedUrls.add(normalized);
+          result.createdInBrowser++;
+        } catch (error) {
+          recordError('create', `Failed to create bookmark for "${r.title}": ${error}`);
+        }
+      }
+
+      await updateFolderMapping(m.id, { lastSync: Date.now() });
+    }
+
+    // Persist this pass's outcome (replace-all: clean → []). A failure to WRITE
+    // the results is not a sync failure — the work already happened — so log it
+    // rather than let it fall into the pass-aborted catch below and get
+    // mislabelled as a 'connection' error.
+    try {
+      await setSyncErrors(errorEntries);
+      await updateSyncStats({
+        lastSyncTime: Date.now(),
+        lastSyncStatus: result.errors.length === 0 ? 'success' : 'partial',
+      });
+    } catch (persistError) {
+      logger.error('Failed to persist reconcile results', persistError);
+    }
+    logger.info('Reconcile completed', result);
     return result;
+  } catch (error) {
+    // A failure that aborted the whole pass (e.g. the collection fetch threw —
+    // offline / server down / bad token). Surface it in the panel as a
+    // connection error so a fully-failed background pass isn't silent.
+    recordError('connection', `Sync failed: ${error}`);
+    await setSyncErrors(errorEntries);
+    await updateSyncStats({ lastSyncTime: Date.now(), lastSyncStatus: 'failed' });
+    throw error;
   } finally {
     setSyncing(false);
+    await releaseReconcileLock();
   }
-}
-
-async function pushSyncForMapping(
-  mapping: FolderMapping
-): Promise<PushSyncResult> {
-  const result: PushSyncResult = {
-    created: 0,
-    updated: 0,
-    errors: [],
-  };
-
-  // Check if folder exists first
-  try {
-    const folders = await browser.bookmarks.get(mapping.firefoxFolderId).catch(() => []);
-    if (folders.length === 0) {
-      logger.warn(`Mapping folder ${mapping.folderName} (${mapping.firefoxFolderId}) no longer exists`);
-      result.errors.push(`Folder "${mapping.folderName}" not found in browser`);
-      return result;
-    }
-  } catch (error) {
-    logger.error(`Error checking folder existence: ${mapping.firefoxFolderId}`, error);
-  }
-
-  // Get Firefox bookmarks in this folder
-  const firefoxBookmarks = await browser.bookmarks.getChildren(
-    mapping.firefoxFolderId
-  );
-  
-  const bookmarks = firefoxBookmarks.filter(
-    (b) => (b.type === 'bookmark' || (!b.type && b.url)) && b.url
-  );
-
-  logger.info(`Push sync for mapping ${mapping.folderName}: found ${firefoxBookmarks.length} items, ${bookmarks.length} are valid bookmarks`);
-
-  // Get all raindrops from collection for comparison
-  const raindrops = await getAllRaindropsInCollection(
-    mapping.raindropCollectionId
-  );
-
-  // Get ALL local bookmark links to avoid duplicates across all mappings
-  const allLinks = await getBookmarkLinks();
-
-  // Create URL map for raindrop lookup
-  const raindropByUrl = new Map<string, Raindrop>();
-  for (const raindrop of raindrops) {
-    raindropByUrl.set(normalizeUrl(raindrop.link), raindrop);
-  }
-
-  // Create firefoxId map for link lookup (across all mappings)
-  const linkByFirefoxId = new Map<string, BookmarkLink>();
-  for (const link of allLinks) {
-    linkByFirefoxId.set(link.firefoxId, link);
-  }
-
-  const toCreate: { bookmark: Bookmarks.BookmarkTreeNode; data: CreateRaindropData }[] = [];
-
-  // Find bookmarks not yet synced to Raindrop
-  for (const bookmark of bookmarks) {
-    if (!bookmark.url) continue;
-
-    // Skip internal browser URLs (about:, chrome:, etc.)
-    if (!isValidSyncUrl(bookmark.url)) {
-      logger.debug(`Skipping invalid URL: ${bookmark.url}`);
-      continue;
-    }
-
-    const existingLink = linkByFirefoxId.get(bookmark.id);
-
-    if (!existingLink) {
-      // Check if already exists in Raindrop by URL
-      const existingRaindrop = raindropByUrl.get(normalizeUrl(bookmark.url));
-
-      if (existingRaindrop) {
-        // Already exists - just create link
-        const link: BookmarkLink = {
-          id: generateId(),
-          firefoxId: bookmark.id,
-          raindropId: existingRaindrop._id,
-          url: bookmark.url,
-          title: bookmark.title,
-          lastModified: Date.now(),
-          contentHash: computeBookmarkHash(bookmark.url, bookmark.title),
-          syncStatus: 'synced',
-          mappingId: mapping.id,
-        };
-        await addBookmarkLink(link);
-      } else {
-        // Collect for bulk create
-        toCreate.push({
-          bookmark,
-          data: {
-            link: bookmark.url,
-            title: bookmark.title,
-            collection: { $id: mapping.raindropCollectionId },
-          },
-        });
-      }
-    }
-  }
-
-  // Bulk create bookmarks in Raindrop
-  if (toCreate.length > 0) {
-    try {
-      logger.info(`Bulk creating ${toCreate.length} raindrops for ${mapping.folderName}`);
-      const createdRaindrops = await createRaindrops(toCreate.map(item => item.data));
-      
-      for (let i = 0; i < createdRaindrops.length; i++) {
-        const raindrop = createdRaindrops[i];
-        const bookmark = toCreate[i].bookmark;
-        
-        if (!raindrop || !raindrop._id) continue;
-
-        const link: BookmarkLink = {
-          id: generateId(),
-          firefoxId: bookmark.id,
-          raindropId: raindrop._id,
-          url: bookmark.url!,
-          title: bookmark.title,
-          lastModified: Date.now(),
-          contentHash: computeBookmarkHash(bookmark.url!, bookmark.title),
-          syncStatus: 'synced',
-          mappingId: mapping.id,
-        };
-        await addBookmarkLink(link);
-        result.created++;
-      }
-    } catch (error) {
-      const errorMsg = `Bulk creation failed for ${mapping.folderName}: ${error}`;
-      logger.error(errorMsg);
-      result.errors.push(errorMsg);
-    }
-  }
-
-  return result;
 }
 
 // ==================== Nested Folder Sync ====================
 
-const MAX_SYNC_DEPTH = 5;
+// Safety ceiling against runaway recursion, not a feature limit: Raindrop.io
+// accepts far deeper nesting (probed ≥8 levels), and real bookmark trees are
+// rarely deeper than a handful. 20 covers any realistic tree while still
+// bounding pathological cases (task 007). Raise if a real use case needs it.
+const MAX_SYNC_DEPTH = 20;
 
-export async function syncFolderWithChildren(
-  firefoxFolderId: string,
-  raindropParentId: number | null,
-  parentMappingId: string | null = null,
+
+/**
+ * Recursive structural reconciliation of a mapped folder↔collection pair
+ * (task 001). Walks both sides' children, creates whatever is missing
+ * (folders, collections, child mappings), and recurses. Idempotent:
+ * re-running on an already reconciled tree creates nothing.
+ *
+ * Returns every mapping in the subtree, including `mapping` itself.
+ */
+export async function reconcileFolderTree(
+  mapping: FolderMapping,
+  collectionsCache: Collection[],
   depth = 0
 ): Promise<FolderMapping[]> {
+  const result: FolderMapping[] = [mapping];
+
   if (depth >= MAX_SYNC_DEPTH) {
-    logger.warn(`Max sync depth (${MAX_SYNC_DEPTH}) reached, stopping recursion`);
-    return [];
+    logger.warn(`Max sync depth (${MAX_SYNC_DEPTH}) reached, stopping reconciliation`);
+    return result;
   }
 
-  // Fetch all collections once and pass the cache down through recursion
-  const collectionsCache = await getAllCollections();
-  return _syncFolderWithChildrenCached(
-    firefoxFolderId,
-    raindropParentId,
-    parentMappingId,
-    depth,
-    collectionsCache
-  );
-}
-
-async function _syncFolderWithChildrenCached(
-  firefoxFolderId: string,
-  raindropParentId: number | null,
-  parentMappingId: string | null,
-  depth: number,
-  collectionsCache: Collection[]
-): Promise<FolderMapping[]> {
-  if (depth >= MAX_SYNC_DEPTH) {
-    logger.warn(`Max sync depth (${MAX_SYNC_DEPTH}) reached, stopping recursion`);
-    return [];
+  // The mapping's own collection is gone (root resurrection is out of scope
+  // for task 001): reconciling anyway would create child collections under a
+  // dead parent id. Bail out; the pull guard already skips this mapping.
+  if (!collectionsCache.some((c) => c._id === mapping.raindropCollectionId)) {
+    logger.warn(
+      `Collection ${mapping.raindropCollectionId} ("${mapping.raindropCollectionName}") not found, skipping reconciliation for ${mapping.folderName}`
+    );
+    return result;
   }
 
-  const mappings: FolderMapping[] = [];
-  const children = await browser.bookmarks.getChildren(firefoxFolderId);
+  setSyncing(true);
+  try {
+    // Existing mappings are authoritative (grilling decision #1): a pair
+    // already linked by a mapping is never re-matched by name.
+    const allMappings = await getFolderMappings();
+    const mappingByCollectionId = new Map<number, FolderMapping>();
+    for (const m of allMappings) {
+      mappingByCollectionId.set(m.raindropCollectionId, m);
+    }
 
-  for (const child of children) {
-    if (child.type === 'folder') {
-      let collectionId: number;
-      let collectionName = child.title;
+    const mappingByFolderId = new Map<string, FolderMapping>();
+    for (const m of allMappings) {
+      mappingByFolderId.set(m.firefoxFolderId, m);
+    }
 
-      // Search in cache instead of making API calls per subfolder
-      const existingCollection = collectionsCache.find((c) => {
-        const matchesTitle = c.title.toLowerCase() === child.title.toLowerCase();
-        const matchesParent = raindropParentId
-          ? c.parent?.$id === raindropParentId
-          : c.parent === null;
-        return matchesTitle && matchesParent;
-      });
+    const browserChildren = await browser.bookmarks.getChildren(
+      mapping.firefoxFolderId
+    );
+    const subfolders = browserChildren.filter(isFolderNode);
 
-      if (existingCollection) {
-        collectionId = existingCollection._id;
-        collectionName = existingCollection.title;
-      } else {
-        const newCollection = await createCollection({
-          title: child.title,
-          parent: raindropParentId ? { $id: raindropParentId } : undefined,
-        });
-        collectionId = newCollection._id;
-        collectionsCache.push(newCollection); // add to cache for subsequent lookups
+    // Unmapped browser subfolders → match an existing child collection by
+    // name (discovery only — existing mappings already handled above), or
+    // create a new collection.
+    for (const subfolder of subfolders) {
+      const linkedMapping = mappingByFolderId.get(subfolder.id);
+      if (linkedMapping) {
+        // A collection deleted in Raindrop while its folder lives on is
+        // handled by propagateRaindropCollectionDeletions (Direction B),
+        // which runs before reconcile and removes the folder + mapping. So
+        // there is nothing to resurrect here — the linked pair is handled by
+        // the collection pass below.
+        continue;
       }
 
-      const mapping: FolderMapping = {
-        id: generateId(),
-        firefoxFolderId: child.id,
-        raindropCollectionId: collectionId,
-        folderName: child.title,
-        raindropCollectionName: collectionName,
-        parentMappingId: parentMappingId || undefined,
-        depth: depth + 1,
-        lastSync: 0,
-        syncChildren: true,
-      };
-
-      await addFolderMapping(mapping);
-      mappings.push(mapping);
-
-      const childMappings = await _syncFolderWithChildrenCached(
-        child.id,
-        collectionId,
-        mapping.id,
-        depth + 1,
+      const nameMatch = getChildCollectionsOf(
+        mapping.raindropCollectionId,
         collectionsCache
+      ).find(
+        (c) =>
+          !mappingByCollectionId.has(c._id) &&
+          namesMatch(c.title, subfolder.title)
       );
-      mappings.push(...childMappings);
+
+      const childCollection =
+        nameMatch ??
+        (await createCollection({
+          title: subfolder.title,
+          parent: { $id: mapping.raindropCollectionId },
+        }));
+      if (!nameMatch) {
+        collectionsCache.push(childCollection); // visible to recursion below
+      }
+
+      const childMapping: FolderMapping = {
+        id: generateId(),
+        firefoxFolderId: subfolder.id,
+        raindropCollectionId: childCollection._id,
+        folderName: subfolder.title,
+        raindropCollectionName: childCollection.title,
+        parentMappingId: mapping.id,
+        depth: mapping.depth + 1,
+        lastSync: 0,
+      };
+      await addFolderMapping(childMapping);
+      // Make the freshly created child collection visible to the collection
+      // pass below so it is not processed a second time.
+      mappingByCollectionId.set(childCollection._id, childMapping);
     }
+
+    // Recompute AFTER the browser pass so freshly created collections are
+    // included — their subtrees still need recursion.
+    const childCollections = getChildCollectionsOf(
+      mapping.raindropCollectionId,
+      collectionsCache
+    );
+
+    for (const childCollection of childCollections) {
+      const existingMapping = mappingByCollectionId.get(childCollection._id);
+
+      let childMapping: FolderMapping;
+      if (existingMapping) {
+        childMapping = existingMapping;
+
+        // Locate the mapped browser folder — a direct child, or moved
+        // elsewhere but still alive (verify with bookmarks.get; "not a direct
+        // child" alone is not proof of deletion). A folder deleted in the
+        // browser is removed together with its collection by
+        // propagateBrowserFolderDeletions (Direction A) before reconcile
+        // runs, so reaching here with a genuinely missing folder is an
+        // inconsistent state — skip it (Direction A cleans it next pass)
+        // rather than resurrecting it.
+        let browserFolder = subfolders.find(
+          (f) => f.id === existingMapping.firefoxFolderId
+        );
+        if (!browserFolder) {
+          try {
+            [browserFolder] = await browser.bookmarks.get(
+              childMapping.firefoxFolderId
+            );
+          } catch {
+            browserFolder = undefined;
+          }
+        }
+        if (!browserFolder) continue;
+
+        // Rename B↔R (task 014): three-way against the baseline name
+        // (mapping.folderName = the name at last sync). Changed only in the
+        // browser → push to Raindrop; changed only in Raindrop → pull;
+        // both → conflict → Raindrop wins. ci+trim drift is not a rename.
+        const renameAction = decideRenameAction(
+          existingMapping.folderName,
+          browserFolder.title,
+          childCollection.title
+        );
+        if (renameAction === 'pull-rename') {
+          await browser.bookmarks.update(childMapping.firefoxFolderId, {
+            title: childCollection.title,
+          });
+        } else if (renameAction === 'push-rename') {
+          await updateCollection(childCollection._id, {
+            title: browserFolder.title,
+          });
+          // Keep the shared cache honest for the recursion below.
+          childCollection.title = browserFolder.title;
+        }
+        const syncedName = childCollection.title;
+        if (
+          !namesMatch(existingMapping.folderName, syncedName) ||
+          existingMapping.raindropCollectionName !== syncedName
+        ) {
+          childMapping = {
+            ...childMapping,
+            folderName: syncedName,
+            raindropCollectionName: syncedName,
+          };
+          await updateFolderMapping(existingMapping.id, {
+            folderName: syncedName,
+            raindropCollectionName: syncedName,
+          });
+        }
+      } else {
+        // Raindrop-only child collection → materialize as a browser folder
+        const folder = await browser.bookmarks.create({
+          parentId: mapping.firefoxFolderId,
+          title: childCollection.title,
+        });
+
+        childMapping = {
+          id: generateId(),
+          firefoxFolderId: folder.id,
+          raindropCollectionId: childCollection._id,
+          folderName: childCollection.title,
+          raindropCollectionName: childCollection.title,
+          parentMappingId: mapping.id,
+          depth: mapping.depth + 1,
+          lastSync: 0,
+        };
+        await addFolderMapping(childMapping);
+      }
+
+      const subtree = await reconcileFolderTree(
+        childMapping,
+        collectionsCache,
+        depth + 1
+      );
+      result.push(...subtree);
+    }
+
+    return result;
+  } finally {
+    setSyncing(false);
+  }
+}
+
+/**
+ * Legacy entry point kept for the `syncFolderWithChildren` message —
+ * now a thin wrapper over reconcileFolderTree (task 001). The folder
+ * must already be mapped; returns the child mappings of the subtree.
+ */
+export async function syncFolderWithChildren(
+  firefoxFolderId: string,
+  _raindropParentId: number | null
+): Promise<FolderMapping[]> {
+  const mappings = await getFolderMappings();
+  const rootMapping = mappings.find(
+    (m) => m.firefoxFolderId === firefoxFolderId
+  );
+  if (!rootMapping) {
+    logger.warn(
+      `syncFolderWithChildren: no mapping found for folder ${firefoxFolderId}`
+    );
+    return [];
   }
 
-  return mappings;
+  const collectionsCache = await getAllCollections();
+  const subtree = await reconcileFolderTree(rootMapping, collectionsCache);
+  return subtree.filter((m) => m.id !== rootMapping.id);
 }
 
 // ==================== Full Re-sync ====================
@@ -737,17 +984,22 @@ export async function performFullResync(): Promise<{
   // Clear existing links
   await saveBookmarkLinks([]);
 
-  // Clear queue to avoid duplicate processing of old events
-  const { clearQueue } = await import('./storage');
-  await clearQueue();
-
-  for (const mapping of mappings) {
-    try {
-      const result = await performInitialSync(mapping);
-      results.push(result);
-    } catch (error) {
-      errors.push(`Failed to sync ${mapping.folderName}: ${error}`);
-    }
+  // One global pass (task 014): with the link table cleared there is no
+  // baseline, so the engine unions every mapping (never deletes) and rebuilds
+  // all links. Looping performInitialSync per mapping would run the same
+  // global reconcile N times, attributing everything to the first mapping.
+  try {
+    const r = await reconcileAllMappings();
+    results.push({
+      matched: r.adopted,
+      createdInRaindrop: r.createdInRaindrop,
+      createdInFirefox: r.createdInBrowser,
+      foldersSynced: (await getFolderMappings()).length,
+      errors: r.errors,
+    });
+    errors.push(...r.errors);
+  } catch (error) {
+    errors.push(`Full resync failed: ${error}`);
   }
 
   await updateSettings({ lastFullSync: Date.now() });
@@ -786,8 +1038,17 @@ export async function handleSyncAlarm(
   alarm: Alarms.Alarm
 ): Promise<void> {
   if (alarm.name === syncAlarmName) {
+    // Automatic path: honour the "Enable Sync" toggle (task 007). Manual
+    // sync bypasses this by calling reconcileAllMappings directly.
+    const settings = await getSettings();
+    if (!settings.enabled) {
+      logger.debug('Auto-sync disabled, skipping periodic pull');
+      return;
+    }
     logger.info('Periodic sync triggered');
-    await pullFromRaindrop();
+    // One unified three-way pass (task 014) — catches up both directions,
+    // including deletions the real-time events missed.
+    await reconcileAllMappings();
   }
 }
 
@@ -837,7 +1098,6 @@ export async function getSyncStatus(): Promise<SyncStatus> {
     linksCount: links.length,
     lastSyncTime: stats.lastSyncTime,
     lastSyncStatus: stats.lastSyncStatus,
-    pendingOperations: stats.pendingOperations,
     userName,
   };
 }
