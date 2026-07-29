@@ -60,9 +60,9 @@ Sync writes bookmarks, which fire bookmark events, which would trigger more reco
 
 `BookmarkLink` (in storage) is the join record tying a `firefoxId` ↔ a `raindropId`, with the last-synced `contentHash` and `mappingId`. Sync is fundamentally "reconcile browser bookmarks, raindrops, and the link table." A `FolderMapping` pairs one browser folder with one Raindrop collection. **Raindrop.io is the source of truth** on conflict.
 
-`storage.ts` wraps `browser.storage.local` and serializes all writes through a `StorageLock` (promise chain) for atomicity — use its exported helpers, don't call `browser.storage.local` directly for these keys. Keys/types/defaults are in `src/types/storage.ts`.
+`storage.ts` wraps `browser.storage.local` and serializes all writes through a `StorageLock` (a thin wrapper over `async-mutex`'s `runExclusive`) for atomicity — use its exported helpers, don't call `browser.storage.local` directly for these keys. Keys/types/defaults are in `src/types/storage.ts`.
 
-`raindropApi.ts` is the only file that talks to `api.raindrop.io`. It has a built-in `RateLimiter` (120 req/min) plus 429/5xx/network retry with backoff, and auto-clears the token on 401. Auth is a Raindrop **Test Token** (not OAuth) stored in local storage. Use its bulk helpers (`createRaindrops`, `getAllRaindropsInCollection`) rather than looping single calls.
+`raindropApi.ts` is the only file that talks to `api.raindrop.io`. HTTP goes through a module-level [`ky`](https://github.com/sindresorhus/ky) instance that handles 429 + `Retry-After`, 5xx exponential backoff and network-error retry (max 3, `Retry-After` capped at 120 s); a custom `RateLimiter` (120 req/min sliding window) runs as a `beforeRequest` hook. The token is fetched in `apiRequest` **before** the ky call (so a missing token fails fast rather than being retried), and 401 auto-clears the token. Auth is a Raindrop **Test Token** (not OAuth) stored in local storage. Use its bulk helpers (`createRaindrops`, `getAllRaindropsInCollection`) rather than looping single calls.
 
 ### MV3 service-worker constraints
 
