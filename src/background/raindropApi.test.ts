@@ -13,7 +13,7 @@ import {
   getCollection,
   updateCollection,
 } from './raindropApi';
-import { clearApiToken } from './storage';
+import { clearApiToken, getApiToken } from './storage';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -172,5 +172,19 @@ describe('error .status contract (syncManager compatibility)', () => {
 
     expect(caughtError).toBeDefined();
     expect((caughtError as { status?: number }).status).toBe(401);
+  });
+});
+
+describe('no-token handling (fail fast, no retry)', () => {
+  it('throws "Not authenticated" and never calls fetch when no token is stored', async () => {
+    vi.mocked(getApiToken).mockResolvedValueOnce(null);
+
+    await expect(getRootCollections()).rejects.toThrow(
+      'Not authenticated. Please add your Test Token in Settings.'
+    );
+    // The token is fetched before ky, so a missing token fails fast: no network
+    // request is made and ky's retry loop never runs (regression guard — a token
+    // check inside beforeRequest would be retried 3× while logged out).
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

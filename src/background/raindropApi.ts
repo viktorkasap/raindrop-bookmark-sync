@@ -71,11 +71,11 @@ const api = ky.create({
       async () => {
         await rateLimiter.wait();
       },
-      async (request) => {
-        const token = await getAccessToken();
-        request.headers.set('Authorization', `Bearer ${token}`);
-        request.headers.set('Content-Type', 'application/json');
-      },
+      // NB: the Authorization header is set in apiRequest, NOT here. The token
+      // is fetched *before* the ky call so a missing token fails fast with
+      // "Not authenticated" — a plain Error thrown inside beforeRequest would be
+      // caught by ky's retry loop (generic errors bypass the statusCodes check)
+      // and retried 3× while logged out.
     ],
     afterResponse: [
       async (_request, _options, response) => {
@@ -119,10 +119,21 @@ async function apiRequest<T>(
   endpoint: string,
   data?: unknown
 ): Promise<T> {
+  // Fetch the token BEFORE calling ky: getAccessToken throws "Not authenticated"
+  // when no token is stored, and doing it here (outside ky's retry loop) makes
+  // that a fail-fast error instead of a 3×-retried one.
+  const token = await getAccessToken();
+
   // ky forbids a leading slash on the input when prefixUrl is set.
   const path = endpoint.replace(/^\//, '');
 
-  const options: Options = { method };
+  const options: Options = {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+  };
   if (data && (method === 'POST' || method === 'PUT')) {
     options.json = data;
   }
