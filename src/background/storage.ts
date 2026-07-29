@@ -1,6 +1,7 @@
 // Storage Manager for the extension
 
 import browser from 'webextension-polyfill';
+import { Mutex } from 'async-mutex';
 import {
   ApiToken,
   SyncSettings,
@@ -14,18 +15,18 @@ import {
 } from '../types/storage';
 import { logger } from '../utils/logger';
 
-// ==================== Storage Lock (Task Queue) ====================
+// ==================== Storage Lock ====================
 
 /**
- * Simple task queue to ensure atomic storage operations
+ * Serializes storage.local writes for atomicity. Thin wrapper over async-mutex;
+ * runExclusive releases the lock on both resolve and reject, so a failing task
+ * cannot wedge the queue.
  */
 class StorageLock {
-  private queue: Promise<any> = Promise.resolve();
+  private mutex = new Mutex();
 
-  async run<T>(task: () => Promise<T>): Promise<T> {
-    const result = this.queue.then(task);
-    this.queue = result.catch(() => {});
-    return result;
+  run<T>(task: () => Promise<T>): Promise<T> {
+    return this.mutex.runExclusive(task);
   }
 }
 

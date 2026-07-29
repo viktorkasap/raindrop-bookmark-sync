@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { STORAGE_KEYS } from '../types/storage';
+import { STORAGE_KEYS, BookmarkLink } from '../types/storage';
 
 // ---- Boundary mock: webextension-polyfill storage.local backed by a real object ----
 
@@ -33,6 +33,8 @@ import {
   disableAutoSyncIfNoMappings,
   getSyncErrors,
   setSyncErrors,
+  addBookmarkLink,
+  getBookmarkLinks,
 } from './storage';
 
 beforeEach(() => {
@@ -116,5 +118,32 @@ describe('disableAutoSyncIfNoMappings (no mappings => no sync)', () => {
 
     expect(disabled).toBe(false);
     expect((store[STORAGE_KEYS.SYNC_SETTINGS] as { enabled: boolean }).enabled).toBe(false);
+  });
+});
+
+describe('storage lock serialization (task 005)', () => {
+  const mk = (id: string, fx: string, rd: number): BookmarkLink => ({
+    id,
+    firefoxId: fx,
+    raindropId: rd,
+    url: `https://example.com/${id}`,
+    title: id,
+    lastModified: 0,
+    contentHash: 'h',
+    syncStatus: 'synced',
+    mappingId: 'm',
+  });
+
+  it('serializes concurrent read-modify-write so no update is lost', async () => {
+    // Without a serializing lock, all three tasks read the same empty list
+    // and the last write wins (lost update). The lock must yield all three.
+    await Promise.all([
+      addBookmarkLink(mk('a', 'fa', 1)),
+      addBookmarkLink(mk('b', 'fb', 2)),
+      addBookmarkLink(mk('c', 'fc', 3)),
+    ]);
+
+    const ids = (await getBookmarkLinks()).map((l) => l.id).sort();
+    expect(ids).toEqual(['a', 'b', 'c']);
   });
 });

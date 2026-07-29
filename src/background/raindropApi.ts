@@ -11,30 +11,27 @@ import {
   RaindropsResponse,
   RaindropApiResponse,
 } from '../types/raindrop';
+import ky, { type Options, HTTPError } from 'ky';
 import { getApiToken, clearApiToken } from './storage';
 import { logger } from '../utils/logger';
 
 const API_BASE_URL = 'https://api.raindrop.io/rest/v1';
 
-// Rate limiting: 120 requests per minute
+// Rate limiting: 120 requests per minute (kept custom — simple sliding window,
+// reused as a ky beforeRequest hook).
 const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 120;
-const RETRY_DELAY_BASE = 1000; // 1 second
-const MAX_RETRIES = 3;
 
 class RateLimiter {
   private requests: number[] = [];
 
   async wait(): Promise<void> {
     const now = Date.now();
-
-    // Remove requests older than the window
     this.requests = this.requests.filter(
       (time) => now - time < RATE_LIMIT_WINDOW
     );
 
     if (this.requests.length >= MAX_REQUESTS_PER_WINDOW) {
-      // Calculate wait time
       const oldestRequest = this.requests[0];
       const waitTime = RATE_LIMIT_WINDOW - (now - oldestRequest) + 100;
       logger.debug(`Rate limit reached, waiting ${waitTime}ms`);
@@ -47,11 +44,6 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
-interface ApiError extends Error {
-  status?: number;
-  response?: Response;
-}
-
 async function getAccessToken(): Promise<string> {
   const token = await getApiToken();
   if (!token) {
@@ -60,93 +52,85 @@ async function getAccessToken(): Promise<string> {
   return token;
 }
 
+// ky honors Retry-After on 429/503 natively, does exponential backoff on the
+// listed status codes, and retries network errors by default — replacing the
+// hand-rolled recursive retry. 401 is deliberately NOT in statusCodes, so it
+// never retries; it is handled (token cleared) in the afterResponse hook.
+const api = ky.create({
+  prefixUrl: API_BASE_URL,
+  retry: {
+    limit: 3,
+    methods: ['get', 'post', 'put', 'delete'],
+    statusCodes: [429, 500, 502, 503, 504],
+    backoffLimit: 120000,
+    // Cap server-provided Retry-After at 120 s (ky's default is Infinity).
+    maxRetryAfter: 120000,
+  },
+  hooks: {
+    beforeRequest: [
+      async () => {
+        await rateLimiter.wait();
+      },
+      async (request) => {
+        const token = await getAccessToken();
+        request.headers.set('Authorization', `Bearer ${token}`);
+        request.headers.set('Content-Type', 'application/json');
+      },
+    ],
+    afterResponse: [
+      async (_request, _options, response) => {
+        // Clear the token on 401 as a side-effect; do NOT throw here.
+        // Throwing a plain Error from afterResponse causes ky to retry the
+        // request (generic errors bypass the statusCodes check). Instead we
+        // let ky throw its own HTTPError (401 is not in statusCodes → no
+        // retry), and handle the friendly message in the beforeError hook.
+        if (response.status === 401) {
+          logger.warn('Token is invalid, clearing...');
+          await clearApiToken();
+        }
+      },
+    ],
+    beforeError: [
+      (error: HTTPError) => {
+        if (error.response) {
+          // Restore the contract the old apiRequest established: attach the HTTP
+          // status code directly on the thrown error so downstream consumers
+          // (e.g. syncManager's isCollectionNotFoundError) can read `error.status`
+          // without knowing about ky's HTTPError shape. ky only exposes status at
+          // error.response.status, so we mirror it to the top level here.
+          (error as unknown as { status?: number }).status =
+            error.response.status;
+        }
+        if (error.response?.status === 401) {
+          // Replace the default HTTPError message with a user-friendly one.
+          // We mutate the message so the error stays an HTTPError instance
+          // (isHTTPError check in ky's retry logic = no retry for 401).
+          error.message =
+            'Token invalid. Please check your Test Token in Settings.';
+        }
+        return error;
+      },
+    ],
+  },
+});
+
 async function apiRequest<T>(
   method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   endpoint: string,
-  data?: unknown,
-  retryCount = 0
+  data?: unknown
 ): Promise<T> {
-  await rateLimiter.wait();
+  // ky forbids a leading slash on the input when prefixUrl is set.
+  const path = endpoint.replace(/^\//, '');
 
-  const accessToken = await getAccessToken();
-
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${accessToken}`,
-    'Content-Type': 'application/json',
-  };
-
-  const options: RequestInit = {
-    method,
-    headers,
-  };
-
+  const options: Options = { method };
   if (data && (method === 'POST' || method === 'PUT')) {
-    options.body = JSON.stringify(data);
+    options.json = data;
   }
 
-  const url = `${API_BASE_URL}${endpoint}`;
   logger.debug(`API Request: ${method} ${endpoint}`, data);
-
-  try {
-    const response = await fetch(url, options);
-
-    if (response.status === 429) {
-      if (retryCount >= MAX_RETRIES) {
-        throw new Error(`Rate limited after ${MAX_RETRIES} retries: ${method} ${endpoint}`);
-      }
-      const retryAfter = parseInt(response.headers.get('Retry-After') || '60');
-      const waitTime = Math.min(retryAfter * 1000, 120000);
-      logger.warn(`Rate limited, waiting ${waitTime}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-      await new Promise((resolve) =>
-        setTimeout(resolve, waitTime)
-      );
-      return apiRequest(method, endpoint, data, retryCount + 1);
-    }
-
-    if (!response.ok) {
-      const error: ApiError = new Error(
-        `API request failed: ${response.status} ${response.statusText}`
-      );
-      error.status = response.status;
-      error.response = response;
-
-      // 401 Unauthorized - token is invalid
-      if (response.status === 401) {
-        logger.warn('Token is invalid, clearing...');
-        await clearApiToken();
-        throw new Error('Token invalid. Please check your Test Token in Settings.');
-      }
-
-      // Retry on server errors
-      if (response.status >= 500 && retryCount < MAX_RETRIES) {
-        const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
-        logger.warn(`Server error, retrying in ${delay}ms`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        return apiRequest(method, endpoint, data, retryCount + 1);
-      }
-
-      throw error;
-    }
-
-    const result = await response.json();
-    logger.debug(`API Response: ${method} ${endpoint}`, result);
-    return result as T;
-  } catch (error) {
-    // Network error, retry
-    if (
-      retryCount < MAX_RETRIES &&
-      error instanceof TypeError &&
-      error.message.includes('fetch')
-    ) {
-      const delay = RETRY_DELAY_BASE * Math.pow(2, retryCount);
-      logger.warn(`Network error, retrying in ${delay}ms`, error);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return apiRequest(method, endpoint, data, retryCount + 1);
-    }
-
-    logger.error(`API request failed: ${method} ${endpoint}`, error);
-    throw error;
-  }
+  const result = await api(path, options).json<T>();
+  logger.debug(`API Response: ${method} ${endpoint}`, result);
+  return result as T;
 }
 
 // ==================== Collections API ====================
