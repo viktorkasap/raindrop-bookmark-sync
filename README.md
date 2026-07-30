@@ -26,8 +26,8 @@ at-a-glance status with a one-click **Sync Now**.
 
 ### From Browser Stores
 
-- **Firefox**: [Add-ons for Firefox](https://addons.mozilla.org/) *(coming soon)*
-- **Chrome**: [Chrome Web Store](https://chrome.google.com/webstore/) *(coming soon)*
+- **Firefox**: [Raindrop Bookmark Sync on Add-ons for Firefox](https://addons.mozilla.org/en-US/firefox/addon/raindrop-bookmark-sync)
+- **Chrome**: [Raindrop Bookmark Sync on the Chrome Web Store](https://chromewebstore.google.com/detail/hjknhomjjhmjokbdkhmbgppgjjljjddn)
 
 ### Manual Installation (Development)
 
