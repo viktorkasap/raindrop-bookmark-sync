@@ -2,6 +2,7 @@
 // Boundary mocks mirror syncManager.test.ts: webextension-polyfill + raindropApi.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Bookmarks } from 'webextension-polyfill';
 import type { FolderMapping, BookmarkLink } from '../types/storage';
 import type { Collection, Raindrop } from '../types/raindrop';
 import { STORAGE_KEYS, DEFAULT_SYNC_SETTINGS } from '../types/storage';
@@ -33,7 +34,7 @@ const { store, browserMock, api } = vi.hoisted(() => {
       create: vi.fn(),
       update: vi.fn(),
       move: vi.fn(),
-      remove: vi.fn(async () => {}),
+      remove: vi.fn(async (_id: string) => {}),
       removeTree: vi.fn(async () => {}),
     },
     alarms: {
@@ -48,6 +49,7 @@ const { store, browserMock, api } = vi.hoisted(() => {
     createRaindrop: vi.fn(),
     createRaindrops: vi.fn(),
     createCollection: vi.fn(),
+    updateCollection: vi.fn(),
     updateRaindrop: vi.fn(),
     deleteRaindrop: vi.fn(),
     deleteCollection: vi.fn(),
@@ -587,6 +589,330 @@ describe('reconcileAllMappings — idempotency and lock', () => {
 
     expect(api.getAllCollections).not.toHaveBeenCalled();
     expect(result.pushed + result.pulled + result.deletedInRaindrop + result.deletedInBrowser).toBe(0);
+  });
+});
+
+describe('bidirectional order with stateful browser/API boundaries', () => {
+  let children: Record<string, Bookmarks.BookmarkTreeNode[]>;
+  let drops: Record<number, Raindrop[]>;
+  let collections: Collection[];
+  let nextId: number;
+  const root = 'ff-folder-1';
+  const rootMapping = (): FolderMapping => (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[])[0];
+  const browserIds = (parent = root): string[] => children[parent].map((n) => n.id);
+  const remoteIds = (parent = 42): number[] => drops[parent].map((r) => r._id);
+  const reorderBrowser = (ids: string[], parent = root): void => {
+    children[parent] = ids.map((id) => children[parent].find((n) => n.id === id)!);
+  };
+  const reorderRemote = (ids: number[], parent = 42): void => {
+    drops[parent] = ids.map((id) => drops[parent].find((r) => r._id === id)!);
+  };
+  const node = (id: number, parentId = root): Bookmarks.BookmarkTreeNode => ({
+    id: `b${id}`, parentId, title: `Bookmark ${id}`, url: `https://example.com/${id}`,
+  });
+  const drop = (id: number, parent = 42): Raindrop => raindrop({
+    _id: id, collection: { $id: parent }, title: `Bookmark ${id}`, link: `https://example.com/${id}`,
+  });
+  function addFolder(id: number, parentId = root, parentCollection = 42, parentMapping = 'm1'): void {
+    children[parentId].push({ id: `f${id}`, title: `Folder ${id}`, parentId });
+    children[`f${id}`] = [];
+    drops[id] = [];
+    collections.push(collection({ _id: id, title: `Folder ${id}`, parent: { $id: parentCollection }, sort: 100 - id }));
+    (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[]).push({
+      ...mapping, id: `m${id}`, firefoxFolderId: `f${id}`, raindropCollectionId: id,
+      folderName: `Folder ${id}`, raindropCollectionName: `Folder ${id}`,
+      parentMappingId: parentMapping, depth: parentId === root ? 1 : 2,
+    });
+  }
+
+  beforeEach(() => {
+    nextId = 100;
+    children = { [root]: [1, 2, 3].map((id) => node(id)) };
+    drops = { 42: [1, 2, 3].map((id) => drop(id)) };
+    collections = [collection({ _id: 42, title: 'Work', sort: 1 })];
+    store[STORAGE_KEYS.FOLDER_MAPPINGS] = [{ ...mapping, bookmarkOrder: { baseline: [1, 2, 3] } }];
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [1, 2, 3].map((id): BookmarkLink => ({
+      ...link, id: `l${id}`, firefoxId: `b${id}`, raindropId: id,
+      title: `Bookmark ${id}`, url: `https://example.com/${id}`,
+      contentHash: computeBookmarkHash(`https://example.com/${id}`, `Bookmark ${id}`),
+    }));
+    browserMock.bookmarks.get.mockImplementation(async (id) => {
+      if (id === root) return [{ id, title: 'Work' }];
+      const found = Object.values(children).flat().find((n) => n.id === id);
+      if (!found) throw new Error('Bookmark not found');
+      return [structuredClone(found)];
+    });
+    browserMock.bookmarks.getChildren.mockImplementation(async (id) =>
+      children[id].map((n, index) => ({ ...n, index })));
+    browserMock.bookmarks.move.mockImplementation(async (id, destination) => {
+      const source = Object.values(children).find((items) => items.some((n) => n.id === id))!;
+      const [moved] = source.splice(source.findIndex((n) => n.id === id), 1);
+      moved.parentId = destination.parentId ?? moved.parentId;
+      const target = children[moved.parentId!];
+      target.splice(destination.index ?? target.length, 0, moved);
+      return structuredClone(moved);
+    });
+    browserMock.bookmarks.update.mockImplementation(async (id, updates) => {
+      const found = Object.values(children).flat().find((n) => n.id === id)!;
+      Object.assign(found, updates);
+      return structuredClone(found);
+    });
+    browserMock.bookmarks.create.mockImplementation(async (data) => {
+      const created = { id: `new${nextId++}`, ...data };
+      children[data.parentId].push(created);
+      if (!data.url) children[created.id] = [];
+      return structuredClone(created);
+    });
+    browserMock.bookmarks.remove.mockImplementation(async (id) => {
+      const parent = Object.values(children).find((items) => items.some((n) => n.id === id))!;
+      parent.splice(parent.findIndex((n) => n.id === id), 1);
+    });
+    api.getAllCollections.mockImplementation(async () => structuredClone(collections));
+    api.getAllRaindropsInCollection.mockImplementation(async (id) => structuredClone(drops[id]));
+    api.updateRaindrop.mockImplementation(async (id, updates) => {
+      const source = Object.values(drops).find((items) => items.some((r) => r._id === id))!;
+      const found = source.find((r) => r._id === id)!;
+      if (updates.collection) {
+        source.splice(source.indexOf(found), 1);
+        drops[updates.collection.$id].push(found);
+      }
+      Object.assign(found, updates);
+      if (updates.order !== undefined) {
+        const items = drops[found.collection.$id];
+        items.splice(items.indexOf(found), 1);
+        items.splice(updates.order, 0, found);
+      }
+      return structuredClone(found);
+    });
+    api.deleteRaindrop.mockImplementation(async (id) => {
+      const items = Object.values(drops).find((rows) => rows.some((r) => r._id === id))!;
+      items.splice(items.findIndex((r) => r._id === id), 1);
+    });
+    api.createRaindrops.mockImplementation(async (items) => items.map((item: { collection: { $id: number } }) => {
+      const created = { _id: nextId++, ...item } as Raindrop;
+      drops[item.collection.$id].push(created);
+      return structuredClone(created);
+    }));
+    api.updateCollection.mockImplementation(async (id, updates) => {
+      const found = collections.find((c) => c._id === id)!;
+      Object.assign(found, updates);
+      return structuredClone(found);
+    });
+    api.createCollection.mockImplementation(async (data) => {
+      const created = collection({ _id: nextId++, sort: 0, ...data });
+      collections.push(created);
+      drops[created._id] = [];
+      return structuredClone(created);
+    });
+  });
+
+  it('pushes a browser drag and does no writes on the following pass', async () => {
+    reorderBrowser(['b3', 'b1', 'b2']);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([3, 1, 2]);
+    expect(api.updateRaindrop).toHaveBeenCalledWith(3, { order: 0 });
+    expect(rootMapping().bookmarkOrder).toEqual({ baseline: [3, 1, 2] });
+    api.updateRaindrop.mockClear();
+    browserMock.bookmarks.move.mockClear();
+    await reconcileAllMappings();
+    expect(api.updateRaindrop).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.move).not.toHaveBeenCalled();
+  });
+
+  it('pulls remote order and lets Raindrop win an order conflict', async () => {
+    reorderRemote([2, 3, 1]);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b2', 'b3', 'b1']);
+    reorderBrowser(['b1', 'b2', 'b3']);
+    reorderRemote([3, 2, 1]);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b3', 'b2', 'b1']);
+    expect(remoteIds()).toEqual([3, 2, 1]);
+  });
+
+  it('upgrades without a baseline and appends remote-only bookmarks in their order', async () => {
+    delete rootMapping().bookmarkOrder;
+    reorderBrowser(['b2', 'b1', 'b3']);
+    drops[42].unshift(drop(5), drop(4));
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([2, 1, 3, 5, 4]);
+    expect(children[root].map((n) => n.title)).toEqual(['Bookmark 2', 'Bookmark 1', 'Bookmark 3', 'Bookmark 5', 'Bookmark 4']);
+  });
+
+  it('preserves an inserted bookmark position in either direction', async () => {
+    children[root].splice(1, 0, node(4));
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(drops[42].map((r) => r.title)).toEqual(['Bookmark 1', 'Bookmark 4', 'Bookmark 2', 'Bookmark 3']);
+    drops[42].splice(2, 0, drop(5));
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(children[root].map((n) => n.title)).toEqual(['Bookmark 1', 'Bookmark 4', 'Bookmark 5', 'Bookmark 2', 'Bookmark 3']);
+  });
+
+  it('does not treat index shifts from deletion as a content conflict', async () => {
+    children[root].splice(1, 1);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([1, 3]);
+    expect(api.updateRaindrop).not.toHaveBeenCalled();
+    expect(rootMapping().bookmarkOrder).toEqual({ baseline: [1, 3] });
+  });
+
+  it('keeps browser order independent of a remote title change', async () => {
+    reorderBrowser(['b3', 'b1', 'b2']);
+    drops[42][0].title = 'Remote title';
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([3, 1, 2]);
+    expect(children[root].find((n) => n.id === 'b1')!.title).toBe('Remote title');
+  });
+
+  it('preserves folder and unsupported-node slots when pulling bookmark order', async () => {
+    addFolder(50);
+    reorderBrowser(['b1', 'f50', 'b2', 'b3']);
+    children[root].splice(3, 0, { id: 'unsupported', title: 'Internal', url: 'chrome://settings' });
+    reorderRemote([3, 2, 1]);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b3', 'f50', 'b2', 'unsupported', 'b1']);
+    expect(browserMock.bookmarks.move.mock.calls.every(([id]) => id.startsWith('b'))).toBe(true);
+  });
+
+  it('sorts nested sibling folders both ways without moving bookmark slots', async () => {
+    addFolder(50);
+    addFolder(51);
+    addFolder(52, 'f50', 50, 'm50');
+    addFolder(53, 'f50', 50, 'm50');
+    reorderBrowser(['b1', 'f51', 'b2', 'f50', 'b3']);
+    reorderBrowser(['f53', 'f52'], 'f50');
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    const remoteFolders = (parent: number): number[] => collections.filter((c) => c.parent?.$id === parent)
+      .sort((a, b) => b.sort - a.sort).map((c) => c._id);
+    expect(remoteFolders(42)).toEqual([51, 50]);
+    expect(remoteFolders(50)).toEqual([53, 52]);
+    collections.find((c) => c._id === 50)!.sort = 10;
+    collections.find((c) => c._id === 52)!.sort = 10;
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b1', 'f50', 'b2', 'f51', 'b3']);
+    expect(browserIds('f50')).toEqual(['f52', 'f53']);
+    api.updateCollection.mockClear();
+    browserMock.bookmarks.move.mockClear();
+    await reconcileAllMappings();
+    expect(api.updateCollection).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.move).not.toHaveBeenCalled();
+  });
+
+  it('places a bookmark moved across mappings at its browser position', async () => {
+    addFolder(50);
+    children.f50 = [node(4, 'f50'), node(5, 'f50')];
+    drops[50] = [drop(4, 50), drop(5, 50)];
+    await reconcileAllMappings();
+    await browserMock.bookmarks.move('b2', { parentId: 'f50', index: 1 });
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([1, 3]);
+    expect(remoteIds(50)).toEqual([4, 2, 5]);
+  });
+
+  it('retains a partial target across background restart instead of pulling its own partial writes', async () => {
+    reorderBrowser(['b3', 'b2', 'b1']);
+    const update = api.updateRaindrop.getMockImplementation()!;
+    let calls = 0;
+    api.updateRaindrop.mockImplementation(async (...args) => {
+      if (++calls === 2) throw new Error('Network unavailable');
+      return update(...args);
+    });
+    expect((await reconcileAllMappings()).errors).toHaveLength(1);
+    expect(remoteIds()).toEqual([3, 1, 2]);
+    expect(rootMapping().bookmarkOrder).toEqual({ baseline: [1, 2, 3], pending: {
+      order: [3, 2, 1], browserOrder: ['b3', 'b2', 'b1'], raindropOrder: [3, 2, 1],
+    } });
+    expect((store[STORAGE_KEYS.SYNC_STATS] as { lastSyncStatus: string }).lastSyncStatus).toBe('partial');
+    api.updateRaindrop.mockImplementation(update);
+    vi.resetModules();
+    const restarted = await import('./syncManager');
+    expect((await restarted.reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteIds()).toEqual([3, 2, 1]);
+    expect(browserIds()).toEqual(['b3', 'b2', 'b1']);
+    expect(rootMapping().bookmarkOrder).toEqual({ baseline: [3, 2, 1] });
+  });
+
+  it('restores mixed-node slots after a browser move fails halfway', async () => {
+    addFolder(50);
+    reorderBrowser(['b1', 'f50', 'b2', 'b3']);
+    reorderRemote([3, 2, 1]);
+    const move = browserMock.bookmarks.move.getMockImplementation()!;
+    let calls = 0;
+    browserMock.bookmarks.move.mockImplementation(async (...args) => {
+      if (++calls === 2) throw new Error('Browser write failed');
+      return move(...args);
+    });
+    expect((await reconcileAllMappings()).errors).toHaveLength(1);
+    expect(browserIds()).toEqual(['b3', 'b1', 'f50', 'b2']);
+    expect(rootMapping().bookmarkOrder?.pending?.browserOrder).toEqual(['b3', 'f50', 'b2', 'b1']);
+    browserMock.bookmarks.move.mockImplementation(move);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b3', 'f50', 'b2', 'b1']);
+  });
+
+  it('continues a partial collection reorder from its saved target', async () => {
+    addFolder(50);
+    addFolder(51);
+    addFolder(52);
+    rootMapping().folderOrder = { baseline: [50, 51, 52] };
+    reorderBrowser(['b1', 'f52', 'b2', 'f51', 'b3', 'f50']);
+    const update = api.updateCollection.getMockImplementation()!;
+    let calls = 0;
+    api.updateCollection.mockImplementation(async (...args) => {
+      if (++calls === 2) throw new Error('Collection update failed');
+      return update(...args);
+    });
+    expect((await reconcileAllMappings()).errors).toHaveLength(1);
+    expect(rootMapping().folderOrder?.pending?.order).toEqual([52, 51, 50]);
+    api.updateCollection.mockImplementation(update);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(collections.filter((c) => c.parent?.$id === 42).sort((a, b) => b.sort - a.sort).map((c) => c._id))
+      .toEqual([52, 51, 50]);
+    expect(rootMapping().folderOrder).toEqual({ baseline: [52, 51, 50] });
+  });
+
+  it('restores a pending mixed layout even when deletions leave one bookmark', async () => {
+    addFolder(50);
+    reorderBrowser(['b1', 'f50', 'b2', 'b3']);
+    reorderRemote([3, 2, 1]);
+    const move = browserMock.bookmarks.move.getMockImplementation()!;
+    let calls = 0;
+    browserMock.bookmarks.move.mockImplementation(async (...args) => {
+      if (++calls === 2) throw new Error('Browser write failed');
+      return move(...args);
+    });
+    await reconcileAllMappings();
+    children[root] = children[root].filter((n) => n.id !== 'b3' && n.id !== 'b2');
+    expect(browserIds()).toEqual(['b1', 'f50']);
+    browserMock.bookmarks.move.mockImplementation(move);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['f50', 'b1']);
+    expect(remoteIds()).toEqual([1]);
+    expect(rootMapping().bookmarkOrder).toEqual({ baseline: [1] });
+  });
+
+  it('appends remote-only folders in manual order on first mapping', async () => {
+    addFolder(50);
+    collections.push(
+      collection({ _id: 51, title: 'Remote A', parent: { $id: 42 }, sort: 1 }),
+      collection({ _id: 52, title: 'Remote B', parent: { $id: 42 }, sort: 2 }),
+    );
+    drops[51] = [];
+    drops[52] = [];
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(children[root].filter((n) => !n.url).map((n) => n.title)).toEqual(['Folder 50', 'Remote B', 'Remote A']);
+    expect(rootMapping().folderOrder).toEqual({ baseline: [50, 52, 51] });
+  });
+
+  it('places a bookmark moved from Raindrop at its remote position', async () => {
+    addFolder(50);
+    children.f50 = [node(4, 'f50'), node(5, 'f50')];
+    drops[50] = [drop(4, 50), drop(5, 50)];
+    await reconcileAllMappings();
+    await api.updateRaindrop(2, { collection: { $id: 50 }, order: 1 });
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds().filter((id) => id.startsWith('b'))).toEqual(['b1', 'b3']);
+    expect(browserIds('f50')).toEqual(['b4', 'b2', 'b5']);
   });
 });
 

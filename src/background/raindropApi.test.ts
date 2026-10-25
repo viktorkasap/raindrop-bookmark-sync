@@ -12,6 +12,8 @@ import {
   getRootCollections,
   getCollection,
   updateCollection,
+  getAllRaindropsInCollection,
+  updateRaindrop,
 } from './raindropApi';
 import { clearApiToken, getApiToken } from './storage';
 
@@ -32,6 +34,33 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe('manual bookmark ordering', () => {
+  it('reads every page in manual order', async () => {
+    fetchMock.mockImplementation(async (req: Request) => {
+      const url = new URL(req.url);
+      expect(url.searchParams.get('sort')).toBe('-sort');
+      expect(url.searchParams.get('perpage')).toBe('50');
+      return jsonResponse({ result: true, items: url.searchParams.get('page') === '0'
+        ? Array.from({ length: 50 }, (_, _id) => ({ _id })) : [{ _id: 50 }] });
+    });
+    expect((await getAllRaindropsInCollection(42)).map((r) => r._id))
+      .toEqual(Array.from({ length: 51 }, (_, i) => i));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sends an order-only update, including index zero', async () => {
+    let body: unknown;
+    fetchMock.mockImplementation(async (req: Request) => {
+      body = await req.clone().json();
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('https://api.raindrop.io/rest/v1/raindrop/7');
+      return jsonResponse({ result: true, item: { _id: 7 } });
+    });
+    await updateRaindrop(7, { order: 0 });
+    expect(body).toEqual({ order: 0 });
+  });
 });
 
 describe('updateCollection (request shape via ky)', () => {

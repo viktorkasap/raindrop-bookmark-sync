@@ -7,6 +7,8 @@
 // direction. Both changed → conflict → Raindrop wins. No baseline is handled
 // by the caller (create/adopt, never delete).
 
+import type { OrderState } from '../types/storage';
+
 export interface BookmarkSnapshot {
   /** computeBookmarkHash / computeRaindropHash over url+title */
   hash: string;
@@ -65,4 +67,58 @@ export function decideRenameAction(
   if (!namesMatch(raindropName, baseName)) return 'pull-rename'; // alone or conflict → Raindrop wins
   if (!namesMatch(browserName, baseName)) return 'push-rename';
   return 'none';
+}
+
+export function sameOrder<T>(a: T[], b: T[]): boolean {
+  return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
+export function decideOrder(
+  state: OrderState | undefined,
+  browserOrder: number[],
+  raindropOrder: number[],
+  members: number[]
+): number[] {
+  const live = new Set(members);
+  const surviving = (ids: number[]): number[] => ids.filter((id) => live.has(id));
+  const b = surviving(browserOrder);
+  const r = surviving(raindropOrder);
+  const preferred = state?.pending
+    ? surviving(state.pending.order)
+    : state?.baseline === undefined || sameOrder(r, surviving(state.baseline))
+      ? b
+      : r;
+  return [...new Set([...preferred, ...b, ...r, ...members])];
+}
+
+// Keep unrelated nodes (including the other node type) in their current slots.
+export function orderInSlots<T>(current: T[], ordered: T[], previous = current): T[] {
+  const members = new Set(ordered);
+  const currentIds = new Set(current);
+  const previousIds = new Set(previous);
+  const layout = [...previous.filter((id) => currentIds.has(id)), ...current.filter((id) => !previousIds.has(id))];
+  const unrelated = current.filter((id) => !members.has(id));
+  let next = 0;
+  let other = 0;
+  return layout.map((id) => members.has(id) ? ordered[next++] : unrelated[other++]);
+}
+
+export function planOrderMoves<T>(current: T[], ordered: T[], previous = current): { id: T; index: number }[] {
+  const target = orderInSlots(current, ordered, previous);
+  const working = [...current];
+  const members = new Set(ordered);
+  const moves: { id: T; index: number }[] = [];
+  const move = (id: T, index: number): void => {
+    working.splice(working.indexOf(id), 1);
+    working.splice(index, 0, id);
+    moves.push({ id, index });
+  };
+  for (let i = 0; i < target.length; i++) {
+    while (working[i] !== target[i]) {
+      if (members.has(target[i])) move(target[i], i);
+      // Vacate an unrelated node's slot by moving the displaced synced node.
+      else move(working[i], target.indexOf(working[i]));
+    }
+  }
+  return moves;
 }

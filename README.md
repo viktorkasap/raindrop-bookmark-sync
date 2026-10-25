@@ -7,6 +7,7 @@ Two-way bookmark synchronization between Firefox/Chrome and [Raindrop.io](https:
 - **Two-way sync** - Changes in browser sync to Raindrop.io and vice versa
 - **Folder mapping** - Choose which bookmark folders sync with which Raindrop collections
 - **Nested folders** - Full support for folder hierarchies
+- **Two-way ordering** - Sync bookmark and nested-folder manual order
 - **Real-time sync** - Bookmark changes sync immediately
 - **Periodic sync** - Configurable interval (1-60 minutes) to pull changes from Raindrop.io
 - **Cross-browser** - Works in Firefox (Manifest V2) and Chrome (Manifest V3)
@@ -86,6 +87,18 @@ against it.
 - When a folder is first mapped to a non-empty collection, the two sides are
   **merged** (union) — mapping never deletes anything that existed before the
   first sync.
+
+### Manual ordering
+
+Bookmarks and sibling subfolders inside a mapped folder sync their order in both
+directions. The first sync (including after upgrading from a version without order
+sync) uses the browser's order and appends Raindrop-only items in their manual order.
+Afterwards, the side that changed wins; simultaneous changes use Raindrop's order.
+Select **Manual** sorting in Raindrop to see the synchronized order.
+
+Bookmarks and folders sort separately, preserving their interleaved browser slots.
+Top-level mappings are not reordered. An interrupted reorder resumes its saved
+target on the next sync before establishing a new baseline.
 
 ### Nested folders: behavior and limitations
 

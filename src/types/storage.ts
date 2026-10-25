@@ -20,6 +20,17 @@ export interface FolderMapping {
   parentMappingId?: string; // for nested folders
   depth: number; // nesting level
   lastSync: number; // timestamp
+  bookmarkOrder?: OrderState;
+  folderOrder?: OrderState;
+}
+
+export interface OrderState {
+  baseline?: number[]; // Raindrop IDs in last successfully synchronized order
+  pending?: {
+    order: number[];
+    browserOrder: string[];
+    raindropOrder: number[];
+  }; // retain mixed-node slots across a partially completed reorder
 }
 
 export interface BookmarkLink {

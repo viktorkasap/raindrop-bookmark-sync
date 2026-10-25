@@ -48,6 +48,10 @@ import {
   namesMatch,
   decideBookmarkAction,
   decideRenameAction,
+  decideOrder,
+  sameOrder,
+  orderInSlots,
+  planOrderMoves,
   type BookmarkSnapshot,
 } from './reconcile';
 import { getChildCollectionsOf } from '../utils/collections';
@@ -332,14 +336,92 @@ function buildLink(
 }
 
 export interface ReconcileResult {
-  pushed: number; // browser→Raindrop updates/moves of linked bookmarks
-  pulled: number; // Raindrop→browser updates/moves/resurrections
+  pushed: number; // browser→Raindrop updates/moves, including order writes
+  pulled: number; // Raindrop→browser updates/moves/resurrections, including order writes
   createdInRaindrop: number; // no-baseline browser-only bookmarks
   createdInBrowser: number; // no-baseline raindrop-only bookmarks
   adopted: number; // URL-matched pairs linked without creating anything
   deletedInRaindrop: number;
   deletedInBrowser: number;
   errors: string[];
+}
+
+async function syncMappingOrder(
+  mapping: FolderMapping,
+  key: 'bookmarkOrder' | 'folderOrder',
+  pairs: { browserId: string; raindropId: number }[],
+  browserBefore: string[],
+  raindropBefore: number[],
+  collections: Collection[]
+): Promise<{ pushed: number; pulled: number }> {
+  const state = mapping[key];
+  const members = pairs.map((p) => p.raindropId);
+  const byBrowser = new Map(pairs.map((p) => [p.browserId, p.raindropId]));
+  const byRaindrop = new Map(pairs.map((p) => [p.raindropId, p.browserId]));
+  const target = decideOrder(state,
+    browserBefore.filter((id) => byBrowser.has(id)).map((id) => byBrowser.get(id)!),
+    raindropBefore, members);
+  let pushed = 0;
+  let pulled = 0;
+
+  if (members.length > 1 || state?.pending) {
+    const children = await browser.bookmarks.getChildren(mapping.firefoxFolderId);
+    const childIds = children.map((node) => node.id);
+    const remote = key === 'bookmarkOrder'
+      ? await getAllRaindropsInCollection(mapping.raindropCollectionId)
+      : getChildCollectionsOf(mapping.raindropCollectionId, collections).sort((a, b) => b.sort - a.sort);
+    const remoteIds = remote.map((item) => item._id);
+    if (pairs.some((p) => !childIds.includes(p.browserId) || !remoteIds.includes(p.raindropId))) {
+      throw new Error('Order members changed during sync; retry on the next sync');
+    }
+
+    const browserTarget = target.map((id) => byRaindrop.get(id)!);
+    const browserLayout = orderInSlots(childIds, browserTarget, state?.pending?.browserOrder);
+    const browserMoves = planOrderMoves(childIds, browserTarget, browserLayout);
+    const remoteTarget = orderInSlots(remoteIds, target, state?.pending?.raindropOrder);
+    const remoteChanged = !sameOrder(remoteIds, remoteTarget);
+    if (browserMoves.length || remoteChanged) {
+      await updateFolderMapping(mapping.id, { [key]: {
+        ...state, pending: { order: target, browserOrder: browserLayout, raindropOrder: remoteTarget },
+      } });
+
+      if (remoteChanged && key === 'bookmarkOrder') {
+        for (const move of planOrderMoves(remoteIds, target, remoteTarget)) {
+          await updateRaindrop(move.id, { order: move.index });
+          pushed++;
+        }
+      } else if (remoteChanged) {
+        for (let i = 0; i < remoteTarget.length; i++) {
+          const collection = collections.find((c) => c._id === remoteTarget[i])!;
+          const sort = remoteTarget.length - i;
+          if (collection.sort === sort) continue;
+          await updateCollection(collection._id, { sort });
+          collection.sort = sort;
+          pushed++;
+        }
+      }
+
+      for (const move of browserMoves) {
+        await browser.bookmarks.move(move.id, { index: move.index });
+        pulled++;
+      }
+
+      const verifiedChildren = await browser.bookmarks.getChildren(mapping.firefoxFolderId);
+      const verifiedRemote = key === 'bookmarkOrder'
+        ? await getAllRaindropsInCollection(mapping.raindropCollectionId)
+        : getChildCollectionsOf(mapping.raindropCollectionId, await getAllCollections())
+          .sort((a, b) => b.sort - a.sort);
+      if (!sameOrder(verifiedChildren.map((n) => n.id), browserLayout)
+        || !sameOrder(verifiedRemote.map((r) => r._id), remoteTarget)) {
+        throw new Error('Order changed during sync; target retained for the next sync');
+      }
+    }
+  }
+
+  if (state?.pending || !sameOrder(state?.baseline ?? [], target) || state?.baseline === undefined) {
+    await updateFolderMapping(mapping.id, { [key]: { baseline: target } });
+  }
+  return { pushed, pulled };
 }
 
 // NOTE: no `settings.enabled` guard here — the toggle gates only the
@@ -385,10 +467,15 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
     const collectionsCache = await getAllCollections();
     await propagateRaindropCollectionDeletions(collectionsCache);
 
+    const collectionsBefore = collectionsCache.slice();
+    const folderChildrenBefore = new Map<string, Bookmarks.BookmarkTreeNode[]>();
+    const failedOrderMappings = new Set<string>();
+
     for (const root of (await getFolderMappings()).filter((m) => m.depth === 0)) {
       try {
-        await reconcileFolderTree(root, collectionsCache);
+        await reconcileFolderTree(root, collectionsCache, 0, folderChildrenBefore);
       } catch (error) {
+        failedOrderMappings.add(root.id);
         const msg = `Failed to reconcile folder tree for ${root.folderName}: ${error}`;
         recordError('folder', msg);
         logger.error(msg);
@@ -562,6 +649,9 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             break;
         }
       } catch (error) {
+        failedOrderMappings.add(link.mappingId);
+        if (bLoc) failedOrderMappings.add(bLoc.mappingId);
+        if (rLoc) failedOrderMappings.add(rLoc.mappingId);
         recordError('sync', `Reconcile failed for "${link.title}": ${error}`);
       }
     }
@@ -623,6 +713,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             linkedUrls.add(normalized);
             result.adopted++;
           } catch (error) {
+            failedOrderMappings.add(m.id);
             // One bad adoption must not abort the rest of the pass.
             recordError('sync', `Failed to adopt "${node.title}": ${error}`);
           }
@@ -661,6 +752,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             result.createdInRaindrop++;
           }
         } catch (error) {
+          failedOrderMappings.add(m.id);
           recordError('create', `Bulk create in Raindrop failed for ${m.folderName}: ${error}`);
         }
       }
@@ -691,11 +783,41 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
           linkedUrls.add(normalized);
           result.createdInBrowser++;
         } catch (error) {
+          failedOrderMappings.add(m.id);
           recordError('create', `Failed to create bookmark for "${r.title}": ${error}`);
         }
       }
 
       await updateFolderMapping(m.id, { lastSync: Date.now() });
+    }
+
+    // Membership is settled before sorting; direction still uses pre-write snapshots.
+    const finalLinks = await getBookmarkLinks();
+    for (const m of allMappings) {
+      let ancestor: FolderMapping | undefined = m;
+      while (ancestor && !failedOrderMappings.has(ancestor.id)) {
+        ancestor = ancestor.parentMappingId ? mappingById.get(ancestor.parentMappingId) : undefined;
+      }
+      if (ancestor || unavailable.has(m.id)) continue;
+      const bookmarks = finalLinks.filter((l) => l.mappingId === m.id);
+      const folders = allMappings.filter((child) => child.parentMappingId === m.id);
+      for (const key of ['bookmarkOrder', 'folderOrder'] as const) {
+        try {
+          const sorted = await syncMappingOrder(m, key,
+            key === 'bookmarkOrder'
+              ? bookmarks.map((l) => ({ browserId: l.firefoxId, raindropId: l.raindropId }))
+              : folders.map((f) => ({ browserId: f.firefoxFolderId, raindropId: f.raindropCollectionId })),
+            (key === 'bookmarkOrder' ? browserByMapping.get(m.id) : folderChildrenBefore.get(m.id))?.map((n) => n.id) ?? [],
+            key === 'bookmarkOrder'
+              ? (raindropsByMapping.get(m.id) ?? []).map((r) => r._id)
+              : getChildCollectionsOf(m.raindropCollectionId, collectionsBefore).sort((a, b) => b.sort - a.sort).map((c) => c._id),
+            collectionsCache);
+          result.pushed += sorted.pushed;
+          result.pulled += sorted.pulled;
+        } catch (error) {
+          recordError(key === 'bookmarkOrder' ? 'sync' : 'folder', `Failed to sync ${key} for ${m.folderName}: ${error}`);
+        }
+      }
     }
 
     // Persist this pass's outcome (replace-all: clean → []). A failure to WRITE
@@ -747,7 +869,8 @@ const MAX_SYNC_DEPTH = 20;
 export async function reconcileFolderTree(
   mapping: FolderMapping,
   collectionsCache: Collection[],
-  depth = 0
+  depth = 0,
+  childrenBefore?: Map<string, Bookmarks.BookmarkTreeNode[]>
 ): Promise<FolderMapping[]> {
   const result: FolderMapping[] = [mapping];
 
@@ -784,6 +907,7 @@ export async function reconcileFolderTree(
     const browserChildren = await browser.bookmarks.getChildren(
       mapping.firefoxFolderId
     );
+    childrenBefore?.set(mapping.id, browserChildren.slice());
     const subfolders = browserChildren.filter(isFolderNode);
 
     // Unmapped browser subfolders → match an existing child collection by
@@ -840,7 +964,7 @@ export async function reconcileFolderTree(
     const childCollections = getChildCollectionsOf(
       mapping.raindropCollectionId,
       collectionsCache
-    );
+    ).sort((a, b) => b.sort - a.sort);
 
     for (const childCollection of childCollections) {
       const existingMapping = mappingByCollectionId.get(childCollection._id);
@@ -929,7 +1053,8 @@ export async function reconcileFolderTree(
       const subtree = await reconcileFolderTree(
         childMapping,
         collectionsCache,
-        depth + 1
+        depth + 1,
+        childrenBefore
       );
       result.push(...subtree);
     }
