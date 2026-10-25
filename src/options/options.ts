@@ -39,6 +39,7 @@ const versionEl = document.getElementById('version')!;
 
 // State
 let isConnected = false;
+let syncEnabled = DEFAULT_SYNC_SETTINGS.enabled;
 let firefoxFolders: Bookmarks.BookmarkTreeNode[] = [];
 let raindropCollections: Collection[] = [];
 let currentMappings: FolderMapping[] = [];
@@ -189,10 +190,8 @@ function refreshControlGating(): void {
   syncNowBtn.disabled = !canSync;
   fullResyncBtn.disabled = !canSync;
 
-  // With nothing to sync the toggle must read OFF, never a stuck "on but
-  // greyed" (the background also forces enabled=false when the last mapping
-  // goes, so this just mirrors that state).
-  if (!canSync) enableSyncToggle.checked = false;
+  // Recompute from saved settings when mappings arrive after loadSettings.
+  enableSyncToggle.checked = canSync && syncEnabled;
 }
 
 // Non-blocking inline feedback near the action buttons. This is the ONLY way
@@ -296,7 +295,7 @@ function showDisconnectedState(): void {
   // and reset the sync toggle so the UI never shows phantom mappings or a
   // stuck "enabled" against no connection.
   currentMappings = [];
-  enableSyncToggle.checked = false;
+  syncEnabled = DEFAULT_SYNC_SETTINGS.enabled;
   syncIntervalSelect.value = DEFAULT_SYNC_SETTINGS.syncInterval.toString();
   renderMappings();
 }
@@ -308,7 +307,7 @@ async function loadSettings(): Promise<void> {
 
     if (response.success && response.data) {
       const settings = response.data as SyncSettings;
-      enableSyncToggle.checked = settings.enabled;
+      syncEnabled = settings.enabled;
       syncIntervalSelect.value = settings.syncInterval.toString();
       debugModeToggle.checked = settings.debugMode;
       // Re-gate: a settings-only live reload must not leave the toggle "on"
@@ -630,10 +629,15 @@ async function removeMapping(mappingId: string): Promise<void> {
 // Update settings
 async function updateSettingsAction(updates: Partial<SyncSettings>): Promise<void> {
   try {
-    await sendMessage('updateSettings', updates);
+    const response = await sendMessage('updateSettings', updates);
+    if (!response.success) {
+      throw new Error(response.error || 'Failed to save settings');
+    }
   } catch (error) {
     console.error('Failed to update settings:', error);
     showToast('Failed to save settings', true);
+  } finally {
+    await loadSettings();
   }
 }
 
