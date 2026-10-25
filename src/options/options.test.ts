@@ -184,3 +184,70 @@ describe('Options Enable Sync state', () => {
     }
   });
 });
+
+describe('Options Full Resync feedback', () => {
+  async function runFullResync(): Promise<void> {
+    el('full-resync-btn').fire('click');
+    el('full-resync-btn').fire('click');
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  it.each([
+    { success: true, errors: [], expected: 'Full resync completed successfully.', isError: false },
+    { success: false, errors: ['Order verification failed'], expected: 'Full resync incomplete — 1 error(s). See Sync Errors for details.', isError: true },
+    { success: true, errors: ['Order verification failed'], expected: 'Full resync incomplete — 1 error(s). See Sync Errors for details.', isError: true },
+    { success: false, errors: [], expected: 'Full resync did not complete.', isError: true },
+  ])('renders actual result $success with $errors', async ({ success, errors, expected, isError }) => {
+    let completed = false;
+    browser.runtime.sendMessage.mockImplementation(async (message) => {
+      if (message.action === 'performFullResync') {
+        completed = true;
+        return { success: true, data: { success, errors, results: [] } };
+      }
+      if (message.action === 'getSyncErrors') return {
+        success: true, data: completed ? errors.map((message) => ({ type: 'sync', message })) : [],
+      };
+      return respond(message);
+    });
+    await openOptions();
+    browser.runtime.sendMessage.mockClear();
+    await runFullResync();
+    expect(el('sync-status-msg').textContent).toBe(expected);
+    expect(el('sync-status-msg').classList.toggle).toHaveBeenLastCalledWith('is-error', isError);
+    expect(browser.runtime.sendMessage).toHaveBeenCalledWith({ action: 'getSyncErrors', data: undefined });
+    expect(browser.runtime.sendMessage).toHaveBeenCalledWith({ action: 'getSyncStats', data: undefined });
+    expect(el('sync-errors-list').innerHTML).toContain(errors.length ? 'sync-error-item' : 'No errors');
+    expect(el('full-resync-btn').disabled).toBe(false);
+  });
+
+  it.each(['rejected response', 'transport error'])('shows failure for %s', async (failure) => {
+    browser.runtime.sendMessage.mockImplementation(async (message) => {
+      if (message.action !== 'performFullResync') return respond(message);
+      if (failure === 'transport error') throw new Error('Background unavailable');
+      return { success: false, error: 'Background unavailable' };
+    });
+    await openOptions();
+    await runFullResync();
+    expect(el('sync-status-msg').textContent).toBe(failure === 'transport error'
+      ? 'Failed to perform full resync' : 'Full resync failed: Background unavailable');
+    expect(el('sync-status-msg').classList.toggle).toHaveBeenLastCalledWith('is-error', true);
+    expect(el('full-resync-btn').disabled).toBe(false);
+  });
+
+  it('clears the previous error panel on a successful retry without a storage event', async () => {
+    let errors = ['Chrome order verification failed'];
+    browser.runtime.sendMessage.mockImplementation(async (message) => {
+      if (message.action === 'performFullResync') return { success: true, data: { success: !errors.length, errors, results: [] } };
+      if (message.action === 'getSyncErrors') return { success: true, data: errors.map((message) => ({ type: 'sync', message })) };
+      return respond(message);
+    });
+    await openOptions();
+    await runFullResync();
+    expect(el('sync-errors-list').innerHTML).toContain('sync-error-item');
+    errors = [];
+    await runFullResync();
+    expect(el('sync-status-msg').textContent).toBe('Full resync completed successfully.');
+    expect(el('sync-errors-list').innerHTML).toContain('No errors');
+    expect(el('sync-status-msg').classList.toggle).toHaveBeenLastCalledWith('is-error', false);
+  });
+});

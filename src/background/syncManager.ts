@@ -354,7 +354,18 @@ async function syncMappingOrder(
   raindropBefore: number[],
   collections: Collection[]
 ): Promise<{ pushed: number; pulled: number }> {
-  const state = mapping[key];
+  const folderChildren = key === 'folderOrder'
+    ? await browser.bookmarks.getChildren(mapping.firefoxFolderId) : undefined;
+  const childCollections = getChildCollectionsOf(mapping.raindropCollectionId, collections)
+    .sort((a, b) => a.sort - b.sort);
+  if (folderChildren) {
+    // Moved folders stay mapped, but only current siblings on both sides can share an order.
+    pairs = pairs.filter((p) => folderChildren.some((n) => n.id === p.browserId)
+      && childCollections.some((c) => c._id === p.raindropId));
+  }
+  // Legacy folder states used descending sort, opposite to Raindrop's visible order.
+  const state = key === 'folderOrder' && mapping.folderOrder?.version !== 1 ? undefined : mapping[key];
+  const version = key === 'folderOrder' ? { version: 1 as const } : {};
   const members = pairs.map((p) => p.raindropId);
   const byBrowser = new Map(pairs.map((p) => [p.browserId, p.raindropId]));
   const byRaindrop = new Map(pairs.map((p) => [p.raindropId, p.browserId]));
@@ -365,14 +376,14 @@ async function syncMappingOrder(
   let pulled = 0;
 
   if (members.length > 1 || state?.pending) {
-    const children = await browser.bookmarks.getChildren(mapping.firefoxFolderId);
+    const children = folderChildren ?? await browser.bookmarks.getChildren(mapping.firefoxFolderId);
     const childIds = children.map((node) => node.id);
     const remote = key === 'bookmarkOrder'
       ? await getAllRaindropsInCollection(mapping.raindropCollectionId)
-      : getChildCollectionsOf(mapping.raindropCollectionId, collections).sort((a, b) => b.sort - a.sort);
+      : childCollections;
     const remoteIds = remote.map((item) => item._id);
     if (pairs.some((p) => !childIds.includes(p.browserId) || !remoteIds.includes(p.raindropId))) {
-      throw new Error('Order members changed during sync; retry on the next sync');
+      throw new Error('Order members changed during sync; sorting skipped for this pass');
     }
 
     const browserTarget = target.map((id) => byRaindrop.get(id)!);
@@ -382,44 +393,55 @@ async function syncMappingOrder(
     const remoteChanged = !sameOrder(remoteIds, remoteTarget);
     if (browserMoves.length || remoteChanged) {
       await updateFolderMapping(mapping.id, { [key]: {
-        ...state, pending: { order: target, browserOrder: browserLayout, raindropOrder: remoteTarget },
+        ...state, ...version, pending: { order: target, browserOrder: browserLayout, raindropOrder: remoteTarget },
       } });
 
-      if (remoteChanged && key === 'bookmarkOrder') {
+      if (remoteChanged) {
         for (const move of planOrderMoves(remoteIds, target, remoteTarget)) {
-          await updateRaindrop(move.id, { order: move.index });
-          pushed++;
-        }
-      } else if (remoteChanged) {
-        for (let i = 0; i < remoteTarget.length; i++) {
-          const collection = collections.find((c) => c._id === remoteTarget[i])!;
-          const sort = remoteTarget.length - i;
-          if (collection.sort === sort) continue;
-          await updateCollection(collection._id, { sort });
-          collection.sort = sort;
+          if (key === 'bookmarkOrder') {
+            await updateRaindrop(move.id, { order: move.index });
+          } else {
+            // Raindrop's client reorders collections with order; sort is the returned rank.
+            await updateCollection(move.id, { parentId: mapping.raindropCollectionId, order: move.index });
+          }
           pushed++;
         }
       }
 
+      const isFirefox = typeof browser.runtime.getBrowserInfo === 'function';
       for (const move of browserMoves) {
-        await browser.bookmarks.move(move.id, { index: move.index });
+        const oldIndex = childIds.indexOf(move.id);
+        // Chrome counts the insertion position before removing the node; Firefox counts after.
+        const index = !isFirefox && move.index > oldIndex ? move.index + 1 : move.index;
+        await browser.bookmarks.move(move.id, { index });
+        childIds.splice(oldIndex, 1);
+        childIds.splice(move.index, 0, move.id);
         pulled++;
       }
 
       const verifiedChildren = await browser.bookmarks.getChildren(mapping.firefoxFolderId);
+      if (key === 'folderOrder') {
+        // A collection move also renumbers siblings, so use server ranks in later mappings.
+        const refreshed = await getAllCollections();
+        collections.splice(0, collections.length, ...refreshed);
+      }
       const verifiedRemote = key === 'bookmarkOrder'
         ? await getAllRaindropsInCollection(mapping.raindropCollectionId)
-        : getChildCollectionsOf(mapping.raindropCollectionId, await getAllCollections())
-          .sort((a, b) => b.sort - a.sort);
-      if (!sameOrder(verifiedChildren.map((n) => n.id), browserLayout)
-        || !sameOrder(verifiedRemote.map((r) => r._id), remoteTarget)) {
-        throw new Error('Order changed during sync; target retained for the next sync');
+        : getChildCollectionsOf(mapping.raindropCollectionId, collections)
+          .sort((a, b) => a.sort - b.sort);
+      const failedSides = [];
+      if (!sameOrder(verifiedChildren.map((n) => n.id), browserLayout)) {
+        failedSides.push(isFirefox ? 'Firefox' : 'Chrome');
+      }
+      if (!sameOrder(verifiedRemote.map((r) => r._id), remoteTarget)) failedSides.push('Raindrop');
+      if (failedSides.length) {
+        throw new Error(`${failedSides.join(' and ')} order verification failed; saved target will be retried on the next sync`);
       }
     }
   }
 
   if (state?.pending || !sameOrder(state?.baseline ?? [], target) || state?.baseline === undefined) {
-    await updateFolderMapping(mapping.id, { [key]: { baseline: target } });
+    await updateFolderMapping(mapping.id, { [key]: { ...version, baseline: target } });
   }
   return { pushed, pulled };
 }
@@ -800,7 +822,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
       }
       if (ancestor || unavailable.has(m.id)) continue;
       const bookmarks = finalLinks.filter((l) => l.mappingId === m.id);
-      const folders = allMappings.filter((child) => child.parentMappingId === m.id);
+      const folders = allMappings.filter((child) => child.depth > 0 && child.id !== m.id);
       for (const key of ['bookmarkOrder', 'folderOrder'] as const) {
         try {
           const sorted = await syncMappingOrder(m, key,
@@ -810,7 +832,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             (key === 'bookmarkOrder' ? browserByMapping.get(m.id) : folderChildrenBefore.get(m.id))?.map((n) => n.id) ?? [],
             key === 'bookmarkOrder'
               ? (raindropsByMapping.get(m.id) ?? []).map((r) => r._id)
-              : getChildCollectionsOf(m.raindropCollectionId, collectionsBefore).sort((a, b) => b.sort - a.sort).map((c) => c._id),
+              : getChildCollectionsOf(m.raindropCollectionId, collectionsBefore).sort((a, b) => a.sort - b.sort).map((c) => c._id),
             collectionsCache);
           result.pushed += sorted.pushed;
           result.pulled += sorted.pulled;
@@ -964,7 +986,7 @@ export async function reconcileFolderTree(
     const childCollections = getChildCollectionsOf(
       mapping.raindropCollectionId,
       collectionsCache
-    ).sort((a, b) => b.sort - a.sort);
+    ).sort((a, b) => a.sort - b.sort);
 
     for (const childCollection of childCollections) {
       const existingMapping = mappingByCollectionId.get(childCollection._id);

@@ -100,6 +100,12 @@ Bookmarks and folders sort separately, preserving their interleaved browser slot
 Top-level mappings are not reordered. An interrupted reorder resumes its saved
 target on the next sync before establishing a new baseline.
 
+Upgrading from the original ordering implementation repairs reversed subfolder
+order once using the browser's current order. Bookmark order is unaffected by
+this migration. Folders moved to a different parent on only one side remain
+mapped for content sync but are excluded from sibling ordering; moving whole
+folder trees between parents is not synchronized.
+
 ### Nested folders: behavior and limitations
 
 Connecting a folder syncs the **whole subtree** — the folder and everything

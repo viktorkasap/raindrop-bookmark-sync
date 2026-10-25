@@ -21,7 +21,7 @@ export interface FolderMapping {
   depth: number; // nesting level
   lastSync: number; // timestamp
   bookmarkOrder?: OrderState;
-  folderOrder?: OrderState;
+  folderOrder?: OrderState & { version?: 1 };
 }
 
 export interface OrderState {

@@ -590,7 +590,7 @@ async function addMapping(): Promise<void> {
     const syncResult = syncResponse.data as InitialSyncResult;
 
     if (syncResult.errors && syncResult.errors.length > 0) {
-      showToast(`Mapping added, but some bookmarks failed to sync: ${syncResult.errors.join('; ')}`, true);
+      showToast(`Mapping added, but sync did not fully complete: ${syncResult.errors.join('; ')}`, true);
     } else {
       showToast(`Mapping added — folders: ${syncResult.foldersSynced}, matched: ${syncResult.matched}, ↑Raindrop: ${syncResult.createdInRaindrop}, ↓Browser: ${syncResult.createdInFirefox}`);
     }
@@ -760,16 +760,23 @@ function setupEventListeners(): void {
       try {
         const response = await sendMessage('performFullResync');
         if (response.success) {
-          showToast('Full resync completed successfully.');
+          const result = response.data as { success: boolean; errors: string[] };
+          if (result.success && result.errors.length === 0) {
+            showToast('Full resync completed successfully.');
+          } else {
+            showToast(result.errors.length
+              ? `Full resync incomplete — ${result.errors.length} error(s). See Sync Errors for details.`
+              : 'Full resync did not complete.', true);
+          }
         } else {
           showToast('Full resync failed: ' + response.error, true);
         }
-        await loadStats();
       } catch (error) {
         showToast('Failed to perform full resync', true);
       } finally {
         fullResyncBtn.textContent = 'Full Resync';
-        fullResyncBtn.disabled = !isConnected;
+        refreshControlGating();
+        await Promise.all([loadStats(), loadSyncErrors()]);
       }
     });
   });

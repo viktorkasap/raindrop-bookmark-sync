@@ -11,6 +11,7 @@ import { computeBookmarkHash, computeRaindropHash } from '../utils/hash';
 const { store, browserMock, api } = vi.hoisted(() => {
   const store: Record<string, unknown> = {};
   const browserMock = {
+    runtime: { getBrowserInfo: undefined as (() => Promise<{ name: string }>) | undefined },
     storage: {
       local: {
         get: vi.fn(async (key: string) =>
@@ -62,7 +63,7 @@ const { store, browserMock, api } = vi.hoisted(() => {
 vi.mock('webextension-polyfill', () => ({ default: browserMock }));
 vi.mock('./raindropApi', () => api);
 
-import { reconcileAllMappings } from './syncManager';
+import { reconcileAllMappings, performFullResync } from './syncManager';
 
 // ---- Fixtures ----
 
@@ -592,7 +593,7 @@ describe('reconcileAllMappings — idempotency and lock', () => {
   });
 });
 
-describe('bidirectional order with stateful browser/API boundaries', () => {
+describe.each(['chrome', 'firefox'] as const)('bidirectional order with %s/API boundaries', (platform) => {
   let children: Record<string, Bookmarks.BookmarkTreeNode[]>;
   let drops: Record<number, Raindrop[]>;
   let collections: Collection[];
@@ -601,6 +602,8 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
   const rootMapping = (): FolderMapping => (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[])[0];
   const browserIds = (parent = root): string[] => children[parent].map((n) => n.id);
   const remoteIds = (parent = 42): number[] => drops[parent].map((r) => r._id);
+  const remoteFolders = (parent = 42): number[] => collections.filter((c) => c.parent?.$id === parent)
+    .sort((a, b) => a.sort - b.sort).map((c) => c._id);
   const reorderBrowser = (ids: string[], parent = root): void => {
     children[parent] = ids.map((id) => children[parent].find((n) => n.id === id)!);
   };
@@ -617,7 +620,7 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     children[parentId].push({ id: `f${id}`, title: `Folder ${id}`, parentId });
     children[`f${id}`] = [];
     drops[id] = [];
-    collections.push(collection({ _id: id, title: `Folder ${id}`, parent: { $id: parentCollection }, sort: 100 - id }));
+    collections.push(collection({ _id: id, title: `Folder ${id}`, parent: { $id: parentCollection }, sort: id - 50 }));
     (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[]).push({
       ...mapping, id: `m${id}`, firefoxFolderId: `f${id}`, raindropCollectionId: id,
       folderName: `Folder ${id}`, raindropCollectionName: `Folder ${id}`,
@@ -626,6 +629,7 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
   }
 
   beforeEach(() => {
+    browserMock.runtime.getBrowserInfo = platform === 'firefox' ? async () => ({ name: 'Firefox' }) : undefined;
     nextId = 100;
     children = { [root]: [1, 2, 3].map((id) => node(id)) };
     drops = { 42: [1, 2, 3].map((id) => drop(id)) };
@@ -646,11 +650,15 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
       children[id].map((n, index) => ({ ...n, index })));
     browserMock.bookmarks.move.mockImplementation(async (id, destination) => {
       const source = Object.values(children).find((items) => items.some((n) => n.id === id))!;
-      const [moved] = source.splice(source.findIndex((n) => n.id === id), 1);
-      moved.parentId = destination.parentId ?? moved.parentId;
-      const target = children[moved.parentId!];
-      target.splice(destination.index ?? target.length, 0, moved);
-      return structuredClone(moved);
+      const oldIndex = source.findIndex((n) => n.id === id);
+      const parentId = destination.parentId ?? source[oldIndex].parentId!;
+      const target = children[parentId];
+      let index = destination.index ?? target.length;
+      if (platform === 'chrome' && source === target && index > oldIndex) index--;
+      const [moved] = source.splice(oldIndex, 1);
+      moved.parentId = parentId;
+      target.splice(index, 0, moved);
+      return { ...structuredClone(moved), index: target.indexOf(moved) };
     });
     browserMock.bookmarks.update.mockImplementation(async (id, updates) => {
       const found = Object.values(children).flat().find((n) => n.id === id)!;
@@ -695,7 +703,15 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     }));
     api.updateCollection.mockImplementation(async (id, updates) => {
       const found = collections.find((c) => c._id === id)!;
-      Object.assign(found, updates);
+      expect(updates).not.toHaveProperty('sort');
+      if (updates.title !== undefined) found.title = updates.title;
+      if (updates.order !== undefined) {
+        expect(updates.parentId).toBe(found.parent?.$id);
+        const siblings = collections.filter((c) => c.parent?.$id === updates.parentId)
+          .sort((a, b) => a.sort - b.sort).filter((c) => c._id !== id);
+        siblings.splice(updates.order, 0, found);
+        siblings.forEach((c, index) => { c.sort = index; });
+      }
       return structuredClone(found);
     });
     api.createCollection.mockImplementation(async (data) => {
@@ -782,12 +798,10 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     reorderBrowser(['b1', 'f51', 'b2', 'f50', 'b3']);
     reorderBrowser(['f53', 'f52'], 'f50');
     expect((await reconcileAllMappings()).errors).toEqual([]);
-    const remoteFolders = (parent: number): number[] => collections.filter((c) => c.parent?.$id === parent)
-      .sort((a, b) => b.sort - a.sort).map((c) => c._id);
     expect(remoteFolders(42)).toEqual([51, 50]);
     expect(remoteFolders(50)).toEqual([53, 52]);
-    collections.find((c) => c._id === 50)!.sort = 10;
-    collections.find((c) => c._id === 52)!.sort = 10;
+    collections.find((c) => c._id === 50)!.sort = -1;
+    collections.find((c) => c._id === 52)!.sort = -1;
     expect((await reconcileAllMappings()).errors).toEqual([]);
     expect(browserIds()).toEqual(['b1', 'f50', 'b2', 'f51', 'b3']);
     expect(browserIds('f50')).toEqual(['f52', 'f53']);
@@ -796,6 +810,37 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     await reconcileAllMappings();
     expect(api.updateCollection).not.toHaveBeenCalled();
     expect(browserMock.bookmarks.move).not.toHaveBeenCalled();
+  });
+
+  it('moves only a displaced collection by order and accepts server-renumbered siblings', async () => {
+    for (const id of [50, 51, 52, 53]) addFolder(id);
+    for (const c of collections.filter((c) => c.parent?.$id === 42)) c.sort = (c._id - 49) * 100;
+    rootMapping().folderOrder = { version: 1, baseline: [50, 51, 52, 53] };
+    reorderBrowser(['b1', 'f53', 'b2', 'f50', 'b3', 'f51', 'f52']);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(api.updateCollection.mock.calls).toEqual([[53, { parentId: 42, order: 0 }]]);
+    expect(remoteFolders()).toEqual([53, 50, 51, 52]);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [53, 50, 51, 52] });
+    api.updateCollection.mockClear();
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(api.updateCollection).not.toHaveBeenCalled();
+  });
+
+  it('resumes the version-1 folder target left by the previous package', async () => {
+    for (const id of [50, 51, 52]) addFolder(id);
+    rootMapping().folderOrder = { version: 1, baseline: [50, 51, 52], pending: {
+      order: [52, 51, 50],
+      browserOrder: ['b1', 'b2', 'b3', 'f52', 'f51', 'f50'], raindropOrder: [52, 51, 50],
+    } };
+    reorderBrowser(['b1', 'b2', 'b3', 'f52', 'f51', 'f50']);
+    store[STORAGE_KEYS.SYNC_ERRORS] = [{ type: 'folder', message: 'Raindrop order verification failed' }];
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteFolders()).toEqual([52, 51, 50]);
+    expect(api.updateCollection.mock.calls).toEqual([
+      [52, { parentId: 42, order: 0 }], [51, { parentId: 42, order: 1 }],
+    ]);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [52, 51, 50] });
+    expect(store[STORAGE_KEYS.SYNC_ERRORS]).toEqual([]);
   });
 
   it('places a bookmark moved across mappings at its browser position', async () => {
@@ -854,7 +899,7 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     addFolder(50);
     addFolder(51);
     addFolder(52);
-    rootMapping().folderOrder = { baseline: [50, 51, 52] };
+    rootMapping().folderOrder = { version: 1, baseline: [50, 51, 52] };
     reorderBrowser(['b1', 'f52', 'b2', 'f51', 'b3', 'f50']);
     const update = api.updateCollection.getMockImplementation()!;
     let calls = 0;
@@ -866,9 +911,8 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     expect(rootMapping().folderOrder?.pending?.order).toEqual([52, 51, 50]);
     api.updateCollection.mockImplementation(update);
     expect((await reconcileAllMappings()).errors).toEqual([]);
-    expect(collections.filter((c) => c.parent?.$id === 42).sort((a, b) => b.sort - a.sort).map((c) => c._id))
-      .toEqual([52, 51, 50]);
-    expect(rootMapping().folderOrder).toEqual({ baseline: [52, 51, 50] });
+    expect(remoteFolders()).toEqual([52, 51, 50]);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [52, 51, 50] });
   });
 
   it('restores a pending mixed layout even when deletions leave one bookmark', async () => {
@@ -900,8 +944,8 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     drops[51] = [];
     drops[52] = [];
     expect((await reconcileAllMappings()).errors).toEqual([]);
-    expect(children[root].filter((n) => !n.url).map((n) => n.title)).toEqual(['Folder 50', 'Remote B', 'Remote A']);
-    expect(rootMapping().folderOrder).toEqual({ baseline: [50, 52, 51] });
+    expect(children[root].filter((n) => !n.url).map((n) => n.title)).toEqual(['Folder 50', 'Remote A', 'Remote B']);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [50, 51, 52] });
   });
 
   it('places a bookmark moved from Raindrop at its remote position', async () => {
@@ -913,6 +957,134 @@ describe('bidirectional order with stateful browser/API boundaries', () => {
     expect((await reconcileAllMappings()).errors).toEqual([]);
     expect(browserIds().filter((id) => id.startsWith('b'))).toEqual(['b1', 'b3']);
     expect(browserIds('f50')).toEqual(['b4', 'b2', 'b5']);
+  });
+
+  it('finishes the two-bookmark mixed layout instead of retrying a no-op forward move', async () => {
+    children[root] = [node(1), node(2)];
+    drops[42] = [drop(1), drop(2)];
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = (store[STORAGE_KEYS.BOOKMARK_LINKS] as BookmarkLink[]).slice(0, 2);
+    addFolder(50);
+    reorderBrowser(['b1', 'f50', 'b2']);
+    reorderRemote([2, 1]);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserIds()).toEqual(['b2', 'f50', 'b1']);
+    expect(browserMock.bookmarks.move).toHaveBeenCalledWith('b1', { index: platform === 'chrome' ? 3 : 2 });
+    browserMock.bookmarks.move.mockClear();
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(browserMock.bookmarks.move).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('replaces legacy folder order with browser order (old pending=%s)', async (pending) => {
+    for (const id of [50, 51, 52]) addFolder(id);
+    rootMapping().folderOrder = {
+      baseline: [50, 51, 52],
+      ...(pending ? { pending: {
+        order: [52, 51, 50], browserOrder: ['f52', 'f51', 'f50'], raindropOrder: [52, 51, 50],
+      } } : {}),
+    };
+    for (const c of collections.filter((c) => c.parent?.$id === 42)) c.sort = 52 - c._id;
+    const browserBefore = browserIds();
+    const bookmarkState = structuredClone(rootMapping().bookmarkOrder);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteFolders()).toEqual([50, 51, 52]);
+    expect(browserIds()).toEqual(browserBefore);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [50, 51, 52] });
+    expect(rootMapping().bookmarkOrder).toEqual(bookmarkState);
+    expect(api.updateRaindrop).not.toHaveBeenCalled();
+    api.updateCollection.mockClear();
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(api.updateCollection).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.move).not.toHaveBeenCalled();
+  });
+
+  it('versions a migration target before writing and resumes it after restart', async () => {
+    for (const id of [50, 51, 52]) addFolder(id);
+    rootMapping().folderOrder = { baseline: [50, 51, 52] };
+    for (const c of collections.filter((c) => c.parent?.$id === 42)) c.sort = 53 - c._id;
+    const update = api.updateCollection.getMockImplementation()!;
+    let calls = 0;
+    api.updateCollection.mockImplementation(async (...args) => {
+      expect(rootMapping().folderOrder).toMatchObject({ version: 1, pending: { order: [50, 51, 52] } });
+      if (++calls === 2) throw new Error('Migration interrupted');
+      return update(...args);
+    });
+    expect((await reconcileAllMappings()).errors).toHaveLength(1);
+    api.updateCollection.mockImplementation(update);
+    vi.resetModules();
+    const restarted = await import('./syncManager');
+    expect((await restarted.reconcileAllMappings()).errors).toEqual([]);
+    expect(remoteFolders()).toEqual([50, 51, 52]);
+    expect(rootMapping().folderOrder).toEqual({ version: 1, baseline: [50, 51, 52] });
+  });
+
+  it.each(['browser', 'raindrop', 'both'])('uses current sibling membership after a folder moves on %s', async (side) => {
+    addFolder(50);
+    addFolder(51);
+    addFolder(52, 'f51', 51, 'm51');
+    children.f50 = [node(4, 'f50')];
+    drops[50] = [drop(4, 50)];
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    if (side !== 'raindrop') await browserMock.bookmarks.move('f50', { parentId: 'f51' });
+    if (side !== 'browser') collections.find((c) => c._id === 50)!.parent = { $id: 51 };
+    children.f50[0].title = 'Edited after moving folder';
+    api.updateCollection.mockClear();
+    for (let pass = 0; pass < 3; pass++) expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect((await performFullResync()).success).toBe(true);
+    expect(drops[50][0].title).toBe('Edited after moving folder');
+    const movedMapping = (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[]).find((m) => m.id === 'm50')!;
+    expect(movedMapping).toMatchObject({ parentMappingId: 'm1', depth: 1 });
+    expect(rootMapping().folderOrder?.baseline).toEqual([51]);
+    if (side === 'both') expect(browserIds('f51')).toEqual(['f50', 'f52']);
+    expect(api.updateCollection).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.removeTree).not.toHaveBeenCalled();
+    expect(api.deleteCollection).not.toHaveBeenCalled();
+  });
+
+  it('keeps independently mapped roots outside sibling ordering', async () => {
+    for (const id of [50, 51, 52]) addFolder(id);
+    const independent = (store[STORAGE_KEYS.FOLDER_MAPPINGS] as FolderMapping[]).find((m) => m.id === 'm51')!;
+    independent.depth = 0;
+    delete independent.parentMappingId;
+    reorderBrowser(['b1', 'b2', 'b3', 'f52', 'f51', 'f50']);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(rootMapping().folderOrder?.baseline).toEqual([52, 50]);
+    expect(remoteFolders()).toEqual([52, 51, 50]);
+    expect(browserIds().indexOf('f51')).toBe(4);
+    expect(browserMock.bookmarks.move.mock.calls.some(([id]) => id === 'f51')).toBe(false);
+  });
+
+  it('reports changed members before sorting without claiming to have saved a new target', async () => {
+    reorderBrowser(['b3', 'b2', 'b1']);
+    const read = api.getAllRaindropsInCollection.getMockImplementation()!;
+    let calls = 0;
+    api.getAllRaindropsInCollection.mockImplementation(async (id) => ++calls === 2
+      ? structuredClone(drops[id].filter((r) => r._id !== 2)) : read(id));
+    const result = await reconcileAllMappings();
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('sorting skipped for this pass');
+    expect(rootMapping().bookmarkOrder?.pending).toBeUndefined();
+    expect(api.updateRaindrop).not.toHaveBeenCalled();
+    api.getAllRaindropsInCollection.mockImplementation(read);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(store[STORAGE_KEYS.SYNC_ERRORS]).toEqual([]);
+  });
+
+  it.each(['browser', 'raindrop'])('names the side when %s order verification fails and clears errors on recovery', async (side) => {
+    const write = side === 'browser' ? browserMock.bookmarks.move : api.updateRaindrop;
+    const implementation = write.getMockImplementation()!;
+    if (side === 'browser') reorderRemote([3, 2, 1]);
+    else reorderBrowser(['b3', 'b2', 'b1']);
+    write.mockResolvedValue(undefined);
+    const result = await reconcileAllMappings();
+    const name = side === 'raindrop' ? 'Raindrop' : platform === 'chrome' ? 'Chrome' : 'Firefox';
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain(`${name} order verification failed`);
+    expect(result.errors[0]).toContain('saved target will be retried on the next sync');
+    expect(rootMapping().bookmarkOrder?.pending?.order).toEqual([3, 2, 1]);
+    write.mockImplementation(implementation);
+    expect((await reconcileAllMappings()).errors).toEqual([]);
+    expect(rootMapping().bookmarkOrder?.pending).toBeUndefined();
+    expect(store[STORAGE_KEYS.SYNC_ERRORS]).toEqual([]);
   });
 });
 

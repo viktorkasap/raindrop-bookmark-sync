@@ -64,6 +64,19 @@ describe('manual bookmark ordering', () => {
 });
 
 describe('updateCollection (request shape via ky)', () => {
+  it.each([0, 2])('PUTs positional order %s with the existing parentId', async (order) => {
+    let body: unknown;
+    fetchMock.mockImplementation(async (req: Request) => {
+      body = await req.clone().json();
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('https://api.raindrop.io/rest/v1/collection/5');
+      return jsonResponse({ result: true, item: { _id: 5, parent: { $id: 42 }, sort: order } });
+    });
+    const result = await updateCollection(5, { parentId: 42, order });
+    expect(body).toEqual({ parentId: 42, order });
+    expect(result.sort).toBe(order);
+  });
+
   it('PUTs the title to /collection/{id} with auth header and returns the item', async () => {
     // ky cancels the request body in a finally block after the response is
     // returned, so we clone the request inside the mock to capture the body
