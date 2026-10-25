@@ -14,6 +14,7 @@ const { browserMock, storageMock, reconcileMock } = vi.hoisted(() => {
     onRemoved?: (id: string, info: unknown) => Promise<void>;
     onChanged?: (id: string, info: unknown) => Promise<void>;
     onMoved?: (id: string, info: unknown) => Promise<void>;
+    onChildrenReordered?: (id: string, info: unknown) => Promise<void>;
   } = {};
   const capture =
     (key: keyof typeof listener) =>
@@ -26,6 +27,7 @@ const { browserMock, storageMock, reconcileMock } = vi.hoisted(() => {
       onRemoved: { addListener: vi.fn(capture('onRemoved')), removeListener: vi.fn() },
       onChanged: { addListener: vi.fn(capture('onChanged')), removeListener: vi.fn() },
       onMoved: { addListener: vi.fn(capture('onMoved')), removeListener: vi.fn() },
+      onChildrenReordered: { addListener: vi.fn(capture('onChildrenReordered')), removeListener: vi.fn() },
       get: vi.fn(async (id: string) => [{ id, title: id }]),
     },
     _listener: listener,
@@ -108,6 +110,26 @@ afterEach(() => {
 });
 
 describe('debounced reconcile trigger', () => {
+  it('debounces bulk reorder events in a mapped folder', async () => {
+    storageMock.findMappingByFirefoxId.mockResolvedValue(mappingB1);
+    await on.onChildrenReordered!('B1', { childIds: ['Y', 'X'] });
+    await on.onChildrenReordered!('B1', { childIds: ['X', 'Y'] });
+    await flushDebounce();
+    expect(reconcileMock.reconcileAllMappings).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores bulk reorders outside mapped folders and during sync', async () => {
+    await on.onChildrenReordered!('outside', { childIds: [] });
+    storageMock.findMappingByFirefoxId.mockResolvedValue(mappingB1);
+    setSyncing(true);
+    try {
+      await on.onChildrenReordered!('B1', { childIds: [] });
+    } finally {
+      setSyncing(false);
+    }
+    await flushDebounce();
+    expect(reconcileMock.reconcileAllMappings).not.toHaveBeenCalled();
+  });
   it('collapses a burst of creates into a single reconcile', async () => {
     storageMock.findMappingByFirefoxId.mockImplementation(async (id: string) =>
       id === 'B1' ? mappingB1 : null

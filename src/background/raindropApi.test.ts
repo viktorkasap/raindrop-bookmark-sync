@@ -12,6 +12,8 @@ import {
   getRootCollections,
   getCollection,
   updateCollection,
+  getAllRaindropsInCollection,
+  updateRaindrop,
 } from './raindropApi';
 import { clearApiToken, getApiToken } from './storage';
 
@@ -34,7 +36,47 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe('manual bookmark ordering', () => {
+  it('reads every page in manual order', async () => {
+    fetchMock.mockImplementation(async (req: Request) => {
+      const url = new URL(req.url);
+      expect(url.searchParams.get('sort')).toBe('-sort');
+      expect(url.searchParams.get('perpage')).toBe('50');
+      return jsonResponse({ result: true, items: url.searchParams.get('page') === '0'
+        ? Array.from({ length: 50 }, (_, _id) => ({ _id })) : [{ _id: 50 }] });
+    });
+    expect((await getAllRaindropsInCollection(42)).map((r) => r._id))
+      .toEqual(Array.from({ length: 51 }, (_, i) => i));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sends an order-only update, including index zero', async () => {
+    let body: unknown;
+    fetchMock.mockImplementation(async (req: Request) => {
+      body = await req.clone().json();
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('https://api.raindrop.io/rest/v1/raindrop/7');
+      return jsonResponse({ result: true, item: { _id: 7 } });
+    });
+    await updateRaindrop(7, { order: 0 });
+    expect(body).toEqual({ order: 0 });
+  });
+});
+
 describe('updateCollection (request shape via ky)', () => {
+  it.each([0, 2])('PUTs positional order %s with the existing parentId', async (order) => {
+    let body: unknown;
+    fetchMock.mockImplementation(async (req: Request) => {
+      body = await req.clone().json();
+      expect(req.method).toBe('PUT');
+      expect(req.url).toBe('https://api.raindrop.io/rest/v1/collection/5');
+      return jsonResponse({ result: true, item: { _id: 5, parent: { $id: 42 }, sort: order } });
+    });
+    const result = await updateCollection(5, { parentId: 42, order });
+    expect(body).toEqual({ parentId: 42, order });
+    expect(result.sort).toBe(order);
+  });
+
   it('PUTs the title to /collection/{id} with auth header and returns the item', async () => {
     // ky cancels the request body in a finally block after the response is
     // returned, so we clone the request inside the mock to capture the body
