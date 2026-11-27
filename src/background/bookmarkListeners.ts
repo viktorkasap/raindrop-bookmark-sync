@@ -1,6 +1,6 @@
 // Firefox Bookmark Event Listeners
 
-import browser, { Bookmarks } from 'webextension-polyfill';
+import browser, { Bookmarks, Events } from 'webextension-polyfill';
 import {
   getSettings,
   findMappingByFirefoxId,
@@ -191,6 +191,16 @@ async function handleBookmarkMoved(
 
 // ==================== Listener Management ====================
 
+async function handleChildrenReordered(id: string): Promise<void> {
+  if (!(await syncActive())) return;
+  if (await hasSyncedAncestor(id)) scheduleReconcile();
+}
+
+// Chrome exposes this event; Firefox uses onMoved and has no equivalent event.
+const onChildrenReordered = (browser.bookmarks as Bookmarks.Static & {
+  onChildrenReordered?: Events.Event<(id: string) => void>;
+}).onChildrenReordered;
+
 let listenersRegistered = false;
 
 export function registerBookmarkListeners(): void {
@@ -203,6 +213,7 @@ export function registerBookmarkListeners(): void {
   browser.bookmarks.onRemoved.addListener(handleBookmarkRemoved);
   browser.bookmarks.onChanged.addListener(handleBookmarkChanged);
   browser.bookmarks.onMoved.addListener(handleBookmarkMoved);
+  onChildrenReordered?.addListener(handleChildrenReordered);
 
   listenersRegistered = true;
   logger.info('Bookmark listeners registered');
@@ -217,6 +228,7 @@ export function unregisterBookmarkListeners(): void {
   browser.bookmarks.onRemoved.removeListener(handleBookmarkRemoved);
   browser.bookmarks.onChanged.removeListener(handleBookmarkChanged);
   browser.bookmarks.onMoved.removeListener(handleBookmarkMoved);
+  onChildrenReordered?.removeListener(handleChildrenReordered);
 
   // Cancel any armed reconcile. Every teardown path (disable auto-sync,
   // disconnect/blank-slate, last mapping removed) calls this, so a pending

@@ -259,7 +259,7 @@ export async function getRaindrops(
 ): Promise<Raindrop[]> {
   const response = await apiRequest<RaindropsResponse>(
     'GET',
-    `/raindrops/${collectionId}?page=${page}&perpage=${perPage}`
+    `/raindrops/${collectionId}?page=${page}&perpage=${perPage}&sort=-sort`
   );
 
   if (!response.result) {

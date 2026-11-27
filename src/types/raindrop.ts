@@ -31,9 +31,10 @@ export interface CreateCollectionData {
 export interface UpdateCollectionData {
   title?: string;
   parent?: { $id: number };
+  parentId?: number;
+  order?: number;
   view?: 'list' | 'simple' | 'grid' | 'masonry';
   public?: boolean;
-  sort?: number;
   expanded?: boolean;
   cover?: string[];
 }
