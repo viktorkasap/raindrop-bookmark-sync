@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+# Read-only: this workflow only checks the code, it publishes nothing.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the running check.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck, test, build, lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build Firefox
+        run: npm run build:firefox
+
+      - name: Build Chrome
+        run: npm run build:chrome
+
+      # web-ext lint reads dist/firefox, so it runs after the Firefox build.
+      - name: Lint the Firefox build
+        run: npm run lint
