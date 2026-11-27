@@ -29,6 +29,6 @@ npm-debug.log*
 # Local-only workspace & tooling (not published)
 .ai/
 .claude/
-CLAUDE.local.md
+*.local.md
 .mcp.json
 /docs/

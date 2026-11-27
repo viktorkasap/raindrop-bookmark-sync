@@ -14,19 +14,58 @@ export function hashString(str: string): string {
 }
 
 /**
+ * True when a title carries no information of its own: it is blank, or it is
+ * just the item's own URL. Raindrop cannot store an empty title — an untitled
+ * item is titled with its link — so both spellings mean "no title".
+ */
+export function isPlaceholderTitle(url: string, title: string): boolean {
+  const trimmed = title.trim();
+  return trimmed === '' || trimmed === url.trim() || urlsMatch(trimmed, url);
+}
+
+/**
+ * Title to store in Raindrop for a browser bookmark: an untitled bookmark is
+ * sent with its URL, which is what Raindrop would show for it anyway.
+ */
+export function titleForRaindrop(url: string, title: string): string {
+  return title.trim() === '' ? url : title;
+}
+
+/**
+ * Title to write into an existing browser bookmark from a raindrop: an
+ * untitled bookmark stays untitled while the raindrop's title is only its link
+ * — the current one, or the last-synced one when the link itself was edited
+ * and Raindrop kept showing the old link as the title.
+ */
+export function titleForBrowser(
+  raindropLink: string,
+  raindropTitle: string,
+  currentBrowserTitle: string,
+  lastSyncedUrl: string
+): string {
+  const onlyALink =
+    isPlaceholderTitle(raindropLink, raindropTitle) ||
+    isPlaceholderTitle(lastSyncedUrl, raindropTitle);
+  return currentBrowserTitle.trim() === '' && onlyALink ? '' : raindropTitle;
+}
+
+function contentKey(url: string, title: string): string {
+  const titlePart = isPlaceholderTitle(url, title) ? '' : title.trim();
+  return `${normalizeUrl(url)}|${titlePart}`;
+}
+
+/**
  * Compute content hash for a bookmark
  */
 export function computeBookmarkHash(url: string, title: string): string {
-  const content = `${normalizeUrl(url)}|${title.trim()}`;
-  return hashString(content);
+  return hashString(contentKey(url, title));
 }
 
 /**
  * Compute content hash for a Raindrop
  */
 export function computeRaindropHash(link: string, title: string): string {
-  const content = `${normalizeUrl(link)}|${title.trim()}`;
-  return hashString(content);
+  return hashString(contentKey(link, title));
 }
 
 /**

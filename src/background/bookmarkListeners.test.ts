@@ -283,6 +283,13 @@ describe('handleBookmarkChanged', () => {
     expect(reconcileMock.reconcileAllMappings).not.toHaveBeenCalled();
   });
 
+  it('reconciles when a linked bookmark title is cleared', async () => {
+    storageMock.findBookmarkLink.mockResolvedValue(link);
+    await on.onChanged!('X', { title: '', url: 'https://example.com/' });
+    await flushDebounce();
+    expect(reconcileMock.reconcileAllMappings).toHaveBeenCalledTimes(1);
+  });
+
   it('reconciles when a mapped folder is renamed', async () => {
     storageMock.findMappingByFirefoxId.mockImplementation(async (id: string) =>
       id === 'B1' ? mappingB1 : null

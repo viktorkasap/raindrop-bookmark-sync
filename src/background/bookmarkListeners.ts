@@ -110,7 +110,7 @@ async function handleBookmarkChanged(
   const link = await findBookmarkLink(id);
   if (link) {
     // Skip a no-op change (content hash unchanged) — avoids a pointless pass.
-    const newTitle = changeInfo.title || link.title;
+    const newTitle = changeInfo.title ?? link.title; // '' is a real edit: the title was cleared
     const newUrl = changeInfo.url || link.url;
     if (computeBookmarkHash(newUrl, newTitle) === link.contentHash) {
       logger.debug('Content hash unchanged, ignoring change event');

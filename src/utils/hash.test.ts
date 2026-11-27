@@ -74,3 +74,34 @@ describe('content hashing', () => {
     );
   });
 });
+
+// Raindrop cannot store an empty title: it shows the link instead. A browser
+// bookmark with no title (icon-only on the bookmarks bar) must therefore count
+// as "same content" as a raindrop titled with its own link.
+describe('content hashing — bookmarks without a title', () => {
+  it('empty bookmark title matches a raindrop titled with its own link', () => {
+    expect(computeBookmarkHash('https://x.com/p', '')).toBe(
+      computeRaindropHash('https://x.com/p', 'https://x.com/p')
+    );
+  });
+  it('whitespace-only title counts as empty', () => {
+    expect(computeBookmarkHash('https://x.com/p', '   ')).toBe(
+      computeBookmarkHash('https://x.com/p', '')
+    );
+  });
+  it('a title that is the same URL in another spelling still counts as no title', () => {
+    expect(computeBookmarkHash('https://x.com/p', '')).toBe(
+      computeRaindropHash('https://x.com/p', 'https://X.com/p/')
+    );
+  });
+  it('a real title still differs from no title', () => {
+    expect(computeBookmarkHash('https://x.com/p', '')).not.toBe(
+      computeRaindropHash('https://x.com/p', 'X')
+    );
+  });
+  it('a title that is a different URL is a real title', () => {
+    expect(computeBookmarkHash('https://x.com/p', '')).not.toBe(
+      computeRaindropHash('https://x.com/p', 'https://y.com/')
+    );
+  });
+});

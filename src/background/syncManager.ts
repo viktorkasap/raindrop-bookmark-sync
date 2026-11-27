@@ -39,6 +39,8 @@ import {
   generateId,
   computeBookmarkHash,
   computeRaindropHash,
+  titleForBrowser,
+  titleForRaindrop,
   normalizeUrl,
   urlsMatch,
   isValidSyncUrl,
@@ -490,7 +492,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             const target = mappingById.get(bLoc!.mappingId)!;
             const updates: Record<string, unknown> = {
               link: bLoc!.node.url,
-              title: bLoc!.node.title,
+              title: titleForRaindrop(bLoc!.node.url!, bLoc!.node.title),
             };
             if (bLoc!.mappingId !== link.mappingId) {
               updates.collection = { $id: target.raindropCollectionId }; // move preserves _id
@@ -521,7 +523,12 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
             } else {
               if (browserSnap!.hash !== raindropSnap!.hash) {
                 await browser.bookmarks.update(link.firefoxId, {
-                  title: rLoc!.raindrop.title,
+                  title: titleForBrowser(
+                    rLoc!.raindrop.link,
+                    rLoc!.raindrop.title,
+                    bLoc.node.title,
+                    link.url
+                  ),
                   url: rLoc!.raindrop.link,
                 });
               }
@@ -635,7 +642,7 @@ export async function reconcileAllMappings(): Promise<ReconcileResult> {
           const created = await createRaindrops(
             toCreate.map((b) => ({
               link: b.url!,
-              title: b.title,
+              title: titleForRaindrop(b.url!, b.title),
               collection: { $id: m.raindropCollectionId },
             }))
           );

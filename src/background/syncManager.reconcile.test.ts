@@ -5,7 +5,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { FolderMapping, BookmarkLink } from '../types/storage';
 import type { Collection, Raindrop } from '../types/raindrop';
 import { STORAGE_KEYS, DEFAULT_SYNC_SETTINGS } from '../types/storage';
-import { computeBookmarkHash, computeRaindropHash } from '../utils/hash';
+import {
+  computeBookmarkHash,
+  computeRaindropHash,
+  hashString,
+  normalizeUrl,
+} from '../utils/hash';
 
 const { store, browserMock, api } = vi.hoisted(() => {
   const store: Record<string, unknown> = {};
@@ -617,5 +622,201 @@ describe('reconcileAllMappings — no-op', () => {
     expect(api.createRaindrops).not.toHaveBeenCalled();
     expect(browserMock.bookmarks.remove).not.toHaveBeenCalled();
     expect(browserMock.bookmarks.create).not.toHaveBeenCalled();
+  });
+});
+
+// ---- Bookmarks without a title (icon-only on the bookmarks bar) ----
+// Raindrop has no empty title: such an item is titled with its own link.
+// That link-title must never be written back over an empty browser title.
+
+describe('reconcileAllMappings — bookmarks without a title', () => {
+  const url = 'https://example.com/';
+  const untitled = { ...browserBookmark, title: '' };
+
+  function expectNoWrites(): void {
+    expect(api.updateRaindrop).not.toHaveBeenCalled();
+    expect(api.createRaindrops).not.toHaveBeenCalled();
+    expect(api.deleteRaindrop).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.update).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.create).not.toHaveBeenCalled();
+    expect(browserMock.bookmarks.remove).not.toHaveBeenCalled();
+  }
+
+  it('linked untitled bookmark + raindrop titled with its link → nothing is written', async () => {
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [
+      { ...link, title: '', contentHash: computeBookmarkHash(url, '') },
+    ];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: url, title: url }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+
+    const result = await reconcileAllMappings();
+
+    expectNoWrites();
+    expect(result.pushed + result.pulled).toBe(0);
+  });
+
+  it('new untitled bookmark → created in Raindrop titled with its link; next pass writes nothing', async () => {
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+    api.createRaindrops.mockResolvedValue([raindrop({ _id: 100, link: url, title: url })]);
+
+    const first = await reconcileAllMappings();
+
+    expect(api.createRaindrops).toHaveBeenCalledWith([
+      { link: url, title: url, collection: { $id: 42 } },
+    ]);
+    expect(first.createdInRaindrop).toBe(1);
+    expect(browserMock.bookmarks.update).not.toHaveBeenCalled();
+
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 100, link: url, title: url }),
+    ]);
+    api.createRaindrops.mockClear();
+
+    const second = await reconcileAllMappings();
+
+    expectNoWrites();
+    expect(second.pushed + second.pulled).toBe(0);
+  });
+
+  it('title cleared in the browser → Raindrop gets the link as title; next pass writes nothing', async () => {
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: url, title: 'Example' }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+
+    const first = await reconcileAllMappings();
+
+    expect(api.updateRaindrop).toHaveBeenCalledWith(7, { link: url, title: url });
+    expect(first.pushed).toBe(1);
+    expect(browserMock.bookmarks.update).not.toHaveBeenCalled();
+
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: url, title: url }),
+    ]);
+    api.updateRaindrop.mockClear();
+
+    const second = await reconcileAllMappings();
+
+    expectNoWrites();
+    expect(second.pushed + second.pulled).toBe(0);
+  });
+
+  it('raindrop link changes while its title is still the link → browser URL follows, title stays empty', async () => {
+    const newUrl = 'https://example.com/new';
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [
+      { ...link, title: '', contentHash: computeBookmarkHash(url, '') },
+    ];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: newUrl, title: newUrl }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+
+    const result = await reconcileAllMappings();
+
+    expect(browserMock.bookmarks.update).toHaveBeenCalledWith('ff-bm-1', {
+      title: '',
+      url: newUrl,
+    });
+    expect(result.pulled).toBe(1);
+  });
+
+  it('raindrop link changes but its title is still the OLD link → title stays empty; passes settle', async () => {
+    const newUrl = 'https://example.com/new';
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [
+      { ...link, title: '', contentHash: computeBookmarkHash(url, '') },
+    ];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: newUrl, title: url }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+
+    await reconcileAllMappings();
+
+    expect(browserMock.bookmarks.update).toHaveBeenCalledWith('ff-bm-1', {
+      title: '',
+      url: newUrl,
+    });
+
+    // Browser now holds the new URL with no title; Raindrop still shows the old link as title.
+    browserMock.bookmarks.getChildren.mockResolvedValue([{ ...untitled, url: newUrl }]);
+    browserMock.bookmarks.update.mockClear();
+
+    await reconcileAllMappings();
+
+    expect(browserMock.bookmarks.update).not.toHaveBeenCalled();
+    expect(api.updateRaindrop).toHaveBeenCalledWith(7, { link: newUrl, title: newUrl });
+
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: newUrl, title: newUrl }),
+    ]);
+    api.updateRaindrop.mockClear();
+
+    const third = await reconcileAllMappings();
+
+    expectNoWrites();
+    expect(third.pushed + third.pulled).toBe(0);
+  });
+
+  it('a real title set in Raindrop still reaches an untitled bookmark', async () => {
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [
+      { ...link, title: '', contentHash: computeBookmarkHash(url, '') },
+    ];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: url, title: 'Example' }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([untitled]);
+
+    await reconcileAllMappings();
+
+    expect(browserMock.bookmarks.update).toHaveBeenCalledWith('ff-bm-1', {
+      title: 'Example',
+      url,
+    });
+  });
+
+  it('baseline saved by an older version (title = link on both sides) → refreshed without touching either side', async () => {
+    // Older versions hashed the link-title literally.
+    const legacyHash = hashString(`${normalizeUrl(url)}|${url}`);
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [{ ...link, title: url, contentHash: legacyHash }];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 7, link: url, title: url }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([{ ...browserBookmark, title: url }]);
+
+    await reconcileAllMappings();
+    expectNoWrites();
+
+    const second = await reconcileAllMappings();
+    expectNoWrites();
+    expect(second.pushed + second.pulled).toBe(0);
+  });
+
+  it('raindrop-only item titled with its link → browser bookmark is created with that title (unchanged behaviour)', async () => {
+    store[STORAGE_KEYS.BOOKMARK_LINKS] = [];
+    api.getAllCollections.mockResolvedValue([collection({ _id: 42 })]);
+    api.getAllRaindropsInCollection.mockResolvedValue([
+      raindrop({ _id: 8, link: url, title: url }),
+    ]);
+    browserMock.bookmarks.getChildren.mockResolvedValue([]);
+    browserMock.bookmarks.create.mockResolvedValue({ id: 'ff-bm-9', title: url, url });
+
+    await reconcileAllMappings();
+
+    expect(browserMock.bookmarks.create).toHaveBeenCalledWith({
+      parentId: 'ff-folder-1',
+      title: url,
+      url,
+    });
   });
 });
